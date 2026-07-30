@@ -1,0 +1,33 @@
+# Daedalus Supply AI - Dependencies
+# Python 3.9+
+# Install: pip install -r requirements.txt
+
+# === CORE (data pipeline - Module 1) ===
+pandas>=2.0
+numpy>=1.24
+sqlalchemy>=2.0          # optional: ORM layer over SQLite
+
+# === PREDICTION (ML - Module 2) ===
+scikit-learn>=1.3
+xgboost>=2.0
+lifelines>=0.28          # survival analysis (Kaplan-Meier, Cox PH, Weibull)
+matplotlib>=3.7
+seaborn>=0.12
+
+# === LOGISTICS OPTIMIZATION (Module 3) ===
+scipy>=1.11              # optimization (minimize, linprog)
+# pulp>=2.7              # optional: LP/MIP solver for stock optimization
+
+# === QUERY AGENT (Module 4) ===
+# No external dependencies - the agent is a local rule-based NL->SQL
+# interface built on sqlite3 + pandas (both already listed above).
+
+# === UTILITIES ===
+jupyter>=1.0             # notebooks for exploration
+tqdm>=4.65               # progress bars
+
+# === DATABASE DRIVERS ===
+psycopg2-binary>=2.9     # PostgreSQL driver
+# mysqlclient>=2.2       # MySQL driver (needs libmysqlclient-dev)
+# PyMySQL>=1.1           # MySQL driver (pure Python, no C deps)
+SQLAlchemy>=2.0          # ORM - works with SQLite, PostgreSQL, MySQL

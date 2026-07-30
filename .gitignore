@@ -1,0 +1,17 @@
+.env
+*.db
+*.pyc
+__pycache__/
+venv/
+.venv/
+raw_data/*.csv
+raw_data/*.pdf
+*.png
+.DS_Store
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+*.log
+.dev-notes.md
+backups/
