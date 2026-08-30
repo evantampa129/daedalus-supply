@@ -22,6 +22,15 @@ scipy>=1.11              # optimization (minimize, linprog)
 # No external dependencies - the agent is a local rule-based NL->SQL
 # interface built on sqlite3 + pandas (both already listed above).
 
+# === WEB DASHBOARD (Module 5) ===
+# Floors are the versions dashboard.py is built and tested against, not the
+# oldest that might work. Streamlit 1.62 for st.context.theme, segmented
+# controls and the width/height keywords used throughout; Plotly 6 for the
+# MapLibre scattermap trace that draws the station network (the older
+# Mapbox traces were removed in that release, not renamed).
+streamlit>=1.62          # dashboard server and widgets
+plotly>=6.0              # interactive charts and the station map
+
 # === UTILITIES ===
 jupyter>=1.0             # notebooks for exploration
 tqdm>=4.65               # progress bars
