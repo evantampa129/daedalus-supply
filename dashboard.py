@@ -11,11 +11,9 @@ database without any risk to the record system. Almost every figure it shows
 is already computed and stored by an upstream module; the dashboard's job is
 to make the fleet picture legible at a glance, not to recompute it.
 
-First view:
+Two views:
     Fleet Overview      the base network on a map, and the aircraft register
-
-A page is one function plus one entry in PAGES, drawing on the data-access
-and presentation helpers below. The remaining views plug into that shell.
+    Parts & Inventory   stock against minimum, by part and by station
 
 Visual conventions (applied consistently across every chart):
     Sequential blue ramp  encodes magnitude (one hue, more-is-darker)
@@ -483,6 +481,62 @@ def stat_tile(col, label, value, caption=None, tone=None):
         )
 
 
+def alert_card(title, detail, tone="critical"):
+    """
+    Render one banner-style alert.
+
+    Args:
+        title: str - the headline, stating what is wrong.
+        detail: str - the supporting numbers.
+        tone: str - a STATUS key setting the accent colour.
+
+    Returns:
+        None
+
+    Notes:
+        Used for AOG shortages, which are the one condition in the system that
+        justifies interrupting the reader's scan of the page. The colour is an
+        accent rule and a tinted surface rather than a filled block: a page of
+        saturated red reads as decoration and stops being a signal. The tone
+        word itself is printed in the title, so the alert survives being read
+        in greyscale.
+    """
+    t = theme()
+    colour = t["status"].get(tone, t["ink_primary"])
+    st.markdown(
+        f"""
+        <div style="border-left:3px solid {colour};background:{t['raised']};
+                    padding:0.6rem 0.9rem;margin-bottom:0.4rem;border-radius:4px;">
+          <div style="font-weight:600;color:{colour};font-size:0.95rem;">{title}</div>
+          <div style="color:{t['ink_secondary']};font-size:0.85rem;">{detail}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def fmt_optional(value, template, fallback):
+    """
+    Format a catalogue value that the record may simply not carry.
+
+    Args:
+        value: the number to format, possibly None or NaN.
+        template: str - a format string with one placeholder, e.g. "{:.0f}d".
+        fallback: str - what to print when the value is missing.
+
+    Returns:
+        str - the formatted value, or the fallback.
+
+    Notes:
+        29 of the 53 catalogue parts have no AOG lead time and 29 have no
+        MTBF: consumables and expendables are not tracked that way. That is a
+        legitimately absent value rather than a data error, so the screen says
+        so in words instead of printing a zero an engineer might plan against.
+    """
+    if value is None or pd.isna(value):
+        return fallback
+    return template.format(value)
+
 def band_colours():
     """
     Map the three risk bands onto the status palette.
@@ -764,11 +818,260 @@ def page_fleet():
 
 
 # ============================================================================
+# PAGE 2: PARTS & INVENTORY
+# ============================================================================
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def inventory_position() -> pd.DataFrame:
+    """
+    Every part-station stock line, with its catalogue attributes attached.
+
+    Args:
+        (none)
+
+    Returns:
+        pd.DataFrame - one row per part-station line, including on-hand and
+        minimum quantities, a coverage percentage and a shortage flag.
+
+    Notes:
+        Coverage is on-hand as a percentage of the minimum stock level, capped
+        at 200%. The cap exists because the bar is there to show how close a
+        line is to running out; a line at 900% of minimum is over-stocked, and
+        that is Module 3's question, not this page's. Lines with no minimum
+        set are reported at full coverage rather than dividing by zero.
+    """
+    stock_col = resolve_stock_column()
+    df = load_table(f"""
+        SELECT i.station, pc.part_number, pc.description, pc.criticality,
+               pc.part_class, pc.ata_chapter,
+               i.{stock_col} AS on_hand, i.quantity_on_hand AS total_held,
+               i.unserviceable, i.minimum_stock_level AS min_level,
+               i.reorder_point, pc.unit_cost_eur, pc.mtbf_flight_hours,
+               pc.lead_time_days_normal, pc.lead_time_days_aog
+        FROM inventory i
+        JOIN parts_catalog pc ON i.part_number = pc.part_number
+    """)
+    df["coverage"] = np.where(
+        df["min_level"] > 0,
+        (100 * df["on_hand"] / df["min_level"]).clip(upper=200),
+        200.0,
+    )
+    df["shortage"] = (df["min_level"] - df["on_hand"]).clip(lower=0)
+    df["below_min"] = df["on_hand"] < df["min_level"]
+    df["crit_rank"] = df["criticality"].map(CRIT_ORDER).fillna(3)
+    return df
+
+
+def stock_table(df, show_station=True, height="content"):
+    """
+    Render stock lines with a coverage bar against the minimum level.
+
+    Args:
+        df: pd.DataFrame - rows from inventory_position().
+        show_station: bool - include the station column. False on a
+            single-station view where the column would repeat one value.
+        height: int or str - pixel height, or "content" to size the table to
+            the rows it holds. A fixed height is used for the network-wide
+            view, where the row count is unbounded.
+
+    Returns:
+        None
+
+    Notes:
+        The bar encodes coverage against minimum, which is the comparison that
+        decides whether to raise a purchase order. Raw quantities stay in their
+        own columns beside it, because a percentage alone cannot tell an
+        engineer whether "below minimum" means one unit short or six.
+    """
+    cols = (["station"] if show_station else []) + [
+        "part_number", "description", "criticality", "on_hand", "min_level",
+        "coverage", "shortage", "unserviceable", "unit_cost_eur",
+        "lead_time_days_normal",
+    ]
+    view = df[cols].copy()
+    headers = (["Station"] if show_station else []) + [
+        "Part", "Description", "Crit", "On hand", "Min", "Coverage",
+        "Short", "Unserv", "Unit cost", "Lead days",
+    ]
+    view.columns = headers
+    st.dataframe(
+        view, width="stretch", hide_index=True, height=height,
+        column_config={
+            "Coverage": st.column_config.ProgressColumn(
+                "Coverage vs min", min_value=0, max_value=200, format="%d%%",
+                help="Serviceable stock as a percentage of the minimum level, "
+                     "capped at 200%."),
+            "Unit cost": st.column_config.NumberColumn(format="EUR %,.0f"),
+            "On hand": st.column_config.NumberColumn(
+                help="Serviceable units only. Unserviceable units awaiting "
+                     "shop input may not be fitted (Part-145 145.A.42)."),
+        },
+    )
+
+
+def page_parts():
+    """
+    Stock against minimum, searchable by part and broken out by station.
+
+    Args:
+        (none)
+
+    Returns:
+        None - renders directly to the Streamlit page.
+
+    Notes:
+        The single actionable number on this page is the count of AOG-critical
+        lines below minimum: those are the shortages that can ground an
+        aircraft, at roughly EUR 15,000 per hour. They are therefore pulled out
+        of the table and printed as alerts above everything else, before the
+        reader has scrolled or filtered anything.
+    """
+    st.subheader("Parts & Inventory")
+
+    inv = inventory_position()
+    short = inv[inv["below_min"]].sort_values(["crit_rank", "shortage"],
+                                              ascending=[True, False])
+    aog = short[short["criticality"] == "AOG"]
+
+    # --- AOG alerts, above the fold ---
+    if not aog.empty:
+        st.markdown(f"**AOG-critical shortages ({len(aog)})**")
+        # Six cards, then a count. Past about six, a wall of red stops reading
+        # as urgency and starts reading as wallpaper; the rest are in the table.
+        for _, r in aog.head(6).iterrows():
+            alert_card(
+                f"AOG - {r['part_number']} short at {r['station']}",
+                f"{r['description']} - {int(r['on_hand'])} serviceable against a "
+                f"minimum of {int(r['min_level'])} ({int(r['shortage'])} short, "
+                + fmt_optional(r["lead_time_days_aog"], "{:.0f}-day AOG lead time",
+                               "no AOG lead time recorded") + ")",
+            )
+        if len(aog) > 6:
+            st.caption(f"{len(aog) - 6} further AOG-critical lines are below "
+                       f"minimum; all of them appear in the table below.")
+        st.divider()
+
+    totals = inv.assign(value=inv["on_hand"] * inv["unit_cost_eur"])
+    c1, c2, c3, c4 = st.columns(4)
+    stat_tile(c1, "Network stock value", f"EUR {totals['value'].sum():,.0f}",
+              f"{len(inv)} part-station lines")
+    stat_tile(c2, "AOG below minimum", f"{len(aog)}", "grounding risk",
+              tone="good" if aog.empty else "critical")
+    mel = int((short["criticality"] == "MEL").sum())
+    stat_tile(c3, "MEL below minimum", f"{mel}", "deferrable under MEL",
+              tone="good" if mel == 0 else "warning")
+    stat_tile(c4, "Total shortages", f"{len(short)}", "lines below minimum")
+
+    st.divider()
+
+    # --- Search ---
+    # One box, matched against both part number and description, because an
+    # engineer holding a removed unit has the part number and an engineer
+    # reading a defect report has the words.
+    st.markdown("**Find a part**")
+    query = st.text_input(
+        "Search", placeholder="Part number or description, e.g. AES-32 or brake",
+        label_visibility="collapsed",
+    ).strip()
+
+    if query:
+        # Matching is done in pandas over the 265 already-loaded lines rather
+        # than by re-querying: it avoids a round trip per keystroke, and the
+        # frame is three orders of magnitude too small for that to matter.
+        mask = (inv["part_number"].str.contains(query, case=False, na=False)
+                | inv["description"].str.contains(query, case=False, na=False))
+        hits = inv[mask]
+        if hits.empty:
+            st.info(f"No part matches '{query}'.")
+            return
+
+        matched_parts = sorted(hits["part_number"].unique())
+        st.caption(f"{len(matched_parts)} part(s) matched, "
+                   f"{len(hits)} stock line(s) across the network.")
+
+        # A single match goes straight to the part detail; several offer a
+        # picker, so the reader is never made to choose when there is no choice.
+        part_number = (matched_parts[0] if len(matched_parts) == 1
+                       else st.selectbox("Part", matched_parts))
+        detail = hits[hits["part_number"] == part_number].sort_values("station")
+        head = detail.iloc[0]
+
+        st.markdown(f"**{part_number} - {head['description']}**")
+        d1, d2, d3, d4 = st.columns(4)
+        stat_tile(d1, "Criticality", str(head["criticality"]),
+                  f"{head['part_class'].title()}, ATA {int(head['ata_chapter'])}",
+                  tone="critical" if head["criticality"] == "AOG" else None)
+        stat_tile(d2, "Network stock", f"{int(detail['on_hand'].sum())}",
+                  f"serviceable across {len(detail)} station(s)")
+        stat_tile(d3, "Unit cost", f"EUR {head['unit_cost_eur']:,.0f}",
+                  fmt_optional(head["mtbf_flight_hours"], "MTBF {:,.0f} FH",
+                               "MTBF not recorded"))
+        stat_tile(d4, "Lead time",
+                  fmt_optional(head["lead_time_days_normal"], "{:.0f}d normal",
+                               "not recorded"),
+                  fmt_optional(head["lead_time_days_aog"], "{:.0f}d on an AOG order",
+                               "no AOG lead time recorded"))
+
+        st.markdown("**Stock by station**")
+        stock_table(detail, show_station=True)
+        return
+
+    # --- No search: the whole network, filtered ---
+    st.markdown("**Stock position**")
+    f1, f2, f3 = st.columns([1, 1, 1])
+    stations = sorted(inv["station"].unique())
+    sel_station = f1.multiselect("Station", stations, default=stations)
+    sel_crit = f2.multiselect("Criticality", ["AOG", "MEL", "ROUTINE"],
+                              default=["AOG", "MEL", "ROUTINE"])
+    only_short = f3.toggle("Below minimum only", value=True,
+                           help="Off shows every stocked line, not just shortages.")
+
+    view = inv[inv["station"].isin(sel_station) & inv["criticality"].isin(sel_crit)]
+    if only_short:
+        view = view[view["below_min"]]
+    view = view.sort_values(["crit_rank", "coverage", "shortage"],
+                            ascending=[True, True, False])
+
+    if view.empty:
+        # An empty result under these filters is good news, not an error state.
+        st.success("No lines match - nothing below minimum for this selection.")
+    else:
+        stock_table(view, show_station=True, height=420)
+
+    st.divider()
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Shortages by station**")
+        by_station = short.groupby("station").size().reset_index(name="count")
+        if by_station.empty:
+            st.success("No station is below minimum on any line.")
+        else:
+            st.plotly_chart(
+                ranked_bar(by_station["station"], by_station["count"],
+                           "<b>%{y}</b><br>%{x} lines short<extra></extra>"),
+                width="stretch")
+    with right:
+        st.markdown("**Shortages by ATA chapter**")
+        by_ata = (short.groupby("ata_chapter").size()
+                  .reset_index(name="count").nlargest(10, "count"))
+        if by_ata.empty:
+            st.success("No chapter is carrying a shortage.")
+        else:
+            st.plotly_chart(
+                ranked_bar("ATA " + by_ata["ata_chapter"].astype(int).astype(str),
+                           by_ata["count"],
+                           "<b>%{y}</b><br>%{x} lines short<extra></extra>"),
+                width="stretch")
+
+
+# ============================================================================
 # APPLICATION SHELL
 # ============================================================================
 
 PAGES = {
     "Fleet Overview": page_fleet,
+    "Parts & Inventory": page_parts,
 }
 
 
@@ -814,8 +1117,8 @@ def main():
         st.caption(f"Expected at: {DB_PATH}")
         return
 
-    # Sidebar navigation. One view so far. The dict is the extension point:
-    # every later page is a function registered here, and nothing else changes.
+    # Sidebar navigation, ordered from fleet-wide context down to the specific
+    # actions the operator can take.
     with st.sidebar:
         st.markdown("### View")
         choice = st.radio("View", list(PAGES.keys()), label_visibility="collapsed")
