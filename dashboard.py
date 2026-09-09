@@ -11,9 +11,10 @@ database without any risk to the record system. Almost every figure it shows
 is already computed and stored by an upstream module; the dashboard's job is
 to make the fleet picture legible at a glance, not to recompute it.
 
-Two views:
+Three views:
     Fleet Overview      the base network on a map, and the aircraft register
     Parts & Inventory   stock against minimum, by part and by station
+    Predictions         risk bands, model plots and expendable demand
 
 Visual conventions (applied consistently across every chart):
     Sequential blue ramp  encodes magnitude (one hue, more-is-darker)
@@ -813,7 +814,7 @@ def page_fleet():
     st.caption(
         "Risk is the fast screening heuristic, the same one the query agent "
         "reports. The calibrated Cox proportional-hazards model lives in "
-        "prediction_model.py."
+        "prediction_model.py; its plots are on the Predictions page."
     )
 
 
@@ -1066,12 +1067,265 @@ def page_parts():
 
 
 # ============================================================================
+# PAGE 3: PREDICTIONS
+# ============================================================================
+
+# Plots written by prediction_model.py. Each entry is the file name, the tab
+# label and the sentence that says what the reader is looking at - a model
+# plot without its interpretation is decoration.
+MODEL_PLOTS = [
+    ("survival_analysis.png", "Survival analysis",
+     "Kaplan-Meier survival curves and the fitted Cox proportional-hazards "
+     "model. Salt exposure is the significant covariate (hazard ratio 1.465, "
+     "p = 0.037): the island bases consume rotables faster than the mainland "
+     "ones. Concordance is 0.563, which is weak - the synthetic history "
+     "carries no censored observations, and that is a data limitation rather "
+     "than a model one."),
+    ("demand_forecast.png", "Demand forecast",
+     "Gradient-boosted regression of monthly expendable consumption against "
+     "fleet activity and lagged demand. Predicted-versus-actual is the panel "
+     "to read: the model tracks the aggregate level but not the month-to-month "
+     "swing, and R-squared on the held-out period is negative. The per-part "
+     "series are short and intermittent, which is what v1.5 addresses."),
+    ("sdr_analysis.png", "SDR analysis",
+     "The real FAA Service Difficulty Report corpus: failures by ATA chapter, "
+     "the most-reported components, and the classifier's confusion matrix. "
+     "This is the only genuinely observed failure evidence in the system; "
+     "everything else about the fleet is synthetic."),
+]
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def expendable_forecast() -> pd.DataFrame:
+    """
+    Forecast next-month expendable consumption per part and station.
+
+    Args:
+        (none)
+
+    Returns:
+        pd.DataFrame - part, station, trailing mean and standard deviation of
+        monthly demand, the forecast quantity, current serviceable stock and
+        a coverage flag. Empty when there is no expendable history.
+
+    Notes:
+        This is the trailing-mean baseline, not the XGBoost regressor. The
+        regressor is trained in prediction_model.py and is not persisted, so
+        reproducing its output here would mean either shipping a second copy
+        of the feature pipeline or training on page load - and with a negative
+        held-out R-squared it does not yet beat this baseline anyway. The
+        honest thing on an operations screen is the number that is actually
+        defensible, with the model's own plots one tab away.
+
+        Six months of trailing history: long enough to average out the
+        month-to-month noise in intermittent demand, short enough to follow
+        the seasonal build into the summer schedule.
+    """
+    stock_col = resolve_stock_column()
+
+    # Latest month present in the demand history anchors the window. Reading it
+    # from the data rather than from the clock means the page behaves the same
+    # whether it is run against live records or the generated dataset.
+    latest = load_table("SELECT MAX(substr(demand_date,1,7)) AS m FROM part_demands")
+    if latest.empty or latest.iloc[0]["m"] is None:
+        return pd.DataFrame()
+    last_month = latest.iloc[0]["m"]
+
+    monthly = load_table("""
+        SELECT pd.part_number, pd.station, substr(pd.demand_date,1,7) AS month,
+               SUM(pd.quantity_required) AS qty
+        FROM part_demands pd
+        JOIN parts_catalog pc ON pd.part_number = pc.part_number
+        WHERE pc.part_class = 'EXPENDABLE' AND substr(pd.demand_date,1,7) <= ?
+        GROUP BY pd.part_number, pd.station, month
+    """, (last_month,))
+    if monthly.empty:
+        return pd.DataFrame()
+
+    # Trailing six-month window, inclusive of the last month with data.
+    window = sorted(monthly["month"].unique())[-6:]
+    recent = monthly[monthly["month"].isin(window)]
+
+    # Reindex over the full part-station-month grid before averaging: a month
+    # in which a part was not consumed is a real zero, and dropping it would
+    # inflate every forecast by the share of quiet months.
+    grid = (recent.set_index(["part_number", "station", "month"])["qty"]
+            .unstack(fill_value=0)
+            .reindex(columns=window, fill_value=0))
+
+    fc = pd.DataFrame({
+        "mean_monthly": grid.mean(axis=1),
+        "std_monthly": grid.std(axis=1),
+    }).reset_index()
+    # Parts are issued in whole units, and rounding down a forecast of 0.6
+    # would report "no demand" for a line that moves most months.
+    fc["forecast_qty"] = np.ceil(fc["mean_monthly"]).astype(int)
+
+    stock = load_table(f"""
+        SELECT i.part_number, i.station, i.{stock_col} AS on_hand,
+               i.minimum_stock_level AS min_level, pc.description,
+               pc.criticality, pc.unit_cost_eur
+        FROM inventory i JOIN parts_catalog pc ON i.part_number = pc.part_number
+        WHERE pc.part_class = 'EXPENDABLE'
+    """)
+    fc = fc.merge(stock, on=["part_number", "station"], how="left").fillna(
+        {"on_hand": 0, "min_level": 0, "description": "", "criticality": "ROUTINE"})
+
+    # Months of cover is the number the planner acts on: stock divided by the
+    # forecast burn rate. A part with no forecast demand has unbounded cover,
+    # reported as the 99-month sentinel rather than infinity so the column
+    # stays sortable.
+    fc["months_cover"] = np.where(fc["forecast_qty"] > 0,
+                                  fc["on_hand"] / fc["forecast_qty"], 99.0)
+    fc["short"] = fc["on_hand"] < fc["forecast_qty"]
+    fc.attrs["window"] = window
+    return fc.sort_values(["short", "months_cover"], ascending=[False, True])
+
+
+def page_predictions():
+    """
+    Model output: risk bands, the fitted plots and next-month demand.
+
+    Args:
+        (none)
+
+    Returns:
+        None - renders directly to the Streamlit page.
+
+    Notes:
+        Three things belong on this page and nothing else: which aircraft to
+        watch, what the models actually fitted, and how much expendable stock
+        next month needs. The plots are read from disk rather than regenerated,
+        because fitting the Cox model and the booster takes minutes and the
+        answer does not change between page loads.
+    """
+    st.subheader("Predictions")
+
+    risk = fleet_risk()
+    counts = risk["band"].value_counts()
+
+    c1, c2, c3, c4 = st.columns(4)
+    stat_tile(c1, "High risk", f"{counts.get('HIGH', 0)}", "aircraft",
+              tone="critical" if counts.get("HIGH", 0) else "good")
+    stat_tile(c2, "Medium risk", f"{counts.get('MEDIUM', 0)}", "aircraft",
+              tone="warning" if counts.get("MEDIUM", 0) else "good")
+    stat_tile(c3, "Low risk", f"{counts.get('LOW', 0)}", "aircraft", tone="good")
+    stat_tile(c4, "Mean score", f"{risk['risk_score'].mean():.1f}", "fleet average")
+
+    st.divider()
+
+    # --- Model plots ---
+    # Tabs rather than three stacked images: they are alternative views of the
+    # same question, not a sequence, and stacking them would push the tables
+    # below two screens of PNG.
+    st.markdown("**Model output**")
+    missing = [name for name, _, _ in MODEL_PLOTS
+               if not os.path.exists(os.path.join(ASSET_DIR, name))]
+    if len(missing) == len(MODEL_PLOTS):
+        st.info("No model plots found. Run: python prediction_model.py")
+    else:
+        for tab, (name, label, note) in zip(
+                st.tabs([label for _, label, _ in MODEL_PLOTS]), MODEL_PLOTS):
+            with tab:
+                path = os.path.join(ASSET_DIR, name)
+                if os.path.exists(path):
+                    st.image(path, width="stretch")
+                    st.caption(note)
+                else:
+                    # One missing plot should not hide the two that are there.
+                    st.info(f"{name} not found. Run: python prediction_model.py")
+
+    st.divider()
+
+    # --- Per-aircraft risk ---
+    st.markdown("**Per-aircraft risk assessment**")
+    r = risk[["tail_number", "home_base", "aircraft_model", "age_years",
+              "cycles_per_fh_ratio", "salt_exposure", "demands",
+              "risk_score", "band"]].copy()
+    r["band"] = r["band"].astype(str)
+    r.columns = ["Tail", "Base", "Model", "Age", "Cycles/FH", "Salt exposure",
+                 "Demands", "Score", "Band"]
+    st.dataframe(
+        colour_band_cells(r, "Band"), width="stretch", hide_index=True,
+        column_config={
+            "Cycles/FH": st.column_config.NumberColumn(format="%.2f"),
+            "Salt exposure": st.column_config.NumberColumn(format="%.1f"),
+            "Score": st.column_config.NumberColumn(format="%.1f"),
+            "Demands": st.column_config.NumberColumn(
+                help="Part demands recorded against this airframe - "
+                     "demonstrated consumption, not a prediction."),
+        },
+    )
+    st.caption(
+        "Score = age x 0.3 + cycles/FH x 10 + salt exposure x 15 + demands x 0.05. "
+        "Bands: LOW below 8, MEDIUM 8-12, HIGH above 12. This is the screening "
+        "heuristic; the survival tab above is the calibrated model."
+    )
+
+    st.divider()
+
+    # --- Expendable demand ---
+    st.markdown("**Expendable demand forecast - next month**")
+    fc = expendable_forecast()
+    if fc.empty:
+        st.info("No expendable demand history. Run: python data_pipeline.py")
+        return
+
+    short_lines = int(fc["short"].sum())
+    f1, f2, f3 = st.columns(3)
+    stat_tile(f1, "Forecast units", f"{int(fc['forecast_qty'].sum())}",
+              "expendables, network-wide")
+    stat_tile(f2, "Lines under-covered", f"{short_lines}",
+              "stock below forecast demand",
+              tone="warning" if short_lines else "good")
+    value = (fc["forecast_qty"] * fc["unit_cost_eur"].fillna(0)).sum()
+    stat_tile(f3, "Forecast value", f"EUR {value:,.0f}", "at catalogue price")
+
+    only_short = st.toggle("Under-covered lines only", value=True, key="fc_short",
+                           help="Off shows every expendable line with forecast demand.")
+    view = fc[fc["forecast_qty"] > 0]
+    if only_short:
+        view = view[view["short"]]
+
+    if view.empty:
+        st.success("Every expendable line holds at least next month's forecast demand.")
+    else:
+        v = view[["station", "part_number", "description", "mean_monthly",
+                  "std_monthly", "forecast_qty", "on_hand", "min_level",
+                  "months_cover"]].copy()
+        v.columns = ["Station", "Part", "Description", "Mean/month", "Std",
+                     "Forecast", "On hand", "Min", "Months cover"]
+        st.dataframe(
+            v, width="stretch", hide_index=True, height=360,
+            column_config={
+                "Mean/month": st.column_config.NumberColumn(format="%.1f"),
+                "Std": st.column_config.NumberColumn(format="%.1f"),
+                "Months cover": st.column_config.NumberColumn(
+                    format="%.1f",
+                    help="Serviceable stock divided by forecast monthly demand. "
+                         "99 means no forecast demand for this line."),
+            },
+        )
+
+    window = fc.attrs.get("window", [])
+    if window:
+        st.caption(
+            f"Trailing-mean baseline over {window[0]} to {window[-1]}, "
+            "counting months with no consumption as zero. The gradient-boosted "
+            "model is in prediction_model.py; its held-out R-squared is "
+            "negative on these short intermittent series, so the baseline is "
+            "what this page reports."
+        )
+
+
+# ============================================================================
 # APPLICATION SHELL
 # ============================================================================
 
 PAGES = {
     "Fleet Overview": page_fleet,
     "Parts & Inventory": page_parts,
+    "Predictions": page_predictions,
 }
 
 
