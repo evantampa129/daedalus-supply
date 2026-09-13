@@ -11,10 +11,11 @@ database without any risk to the record system. Almost every figure it shows
 is already computed and stored by an upstream module; the dashboard's job is
 to make the fleet picture legible at a glance, not to recompute it.
 
-Three views:
+Four views:
     Fleet Overview      the base network on a map, and the aircraft register
     Parts & Inventory   stock against minimum, by part and by station
     Predictions         risk bands, model plots and expendable demand
+    Logistics           optimiser output and the AOG response simulator
 
 Visual conventions (applied consistently across every chart):
     Sequential blue ramp  encodes magnitude (one hue, more-is-darker)
@@ -280,6 +281,31 @@ def resolve_stock_column() -> str:
     finally:
         conn.close()
     return "quantity_serviceable" if "quantity_serviceable" in cols else "serviceable"
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def table_exists(name: str) -> bool:
+    """
+    Report whether a table or view is present in the database.
+
+    Args:
+        name: str - table or view name, from a literal in this module.
+
+    Returns:
+        bool - True when the object exists.
+
+    Notes:
+        Three tables are written by modules that are optional at this point in
+        the workflow: stock_recommendations and transfer_recommendations come
+        from logistics_optimizer.py, faa_sdr_raw from a data_pipeline.py run
+        that had SDR CSVs available. Checking is how those pages offer the
+        command that fixes the gap instead of a traceback.
+    """
+    rows = load_table(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+        (name,),
+    )
+    return not rows.empty
 
 
 def database_exists() -> bool:
@@ -1319,6 +1345,273 @@ def page_predictions():
 
 
 # ============================================================================
+# PAGE 4: LOGISTICS
+# ============================================================================
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def optimizer_tables():
+    """
+    Load the data the AOG router needs, using Module 3's own loader.
+
+    Args:
+        (none)
+
+    Returns:
+        dict of str -> pd.DataFrame as returned by logistics_optimizer.load_data(),
+        or None when the module cannot be imported.
+
+    Notes:
+        The simulator on this page calls logistics_optimizer.route_aog_request
+        directly rather than reimplementing it. The routing rules - serviceable
+        stock only, transit times door to door, EUR 15,000 per hour of grounding,
+        3x premium on an expedited order - are decisions that belong to Module 3,
+        and a second copy of them here would drift from the terminal output the
+        first time either changed.
+
+        The import is guarded because logistics_optimizer pulls in SciPy for
+        Engine 1. The dashboard's other four pages need none of that, so a
+        missing scientific stack degrades one panel instead of the whole app.
+
+        One consequence of reusing Module 3's loader: the simulator reads
+        Module 3's database path, so DAEDALUS_DB_PATH steers the other four
+        pages but not this panel. That is deliberate - the routing answer has
+        to come from the same stock figures the optimiser itself ran on.
+    """
+    try:
+        import logistics_optimizer as opt
+    except ImportError:
+        return None
+    return opt.load_data()
+
+
+def page_logistics():
+    """
+    Optimiser output and the AOG response simulator.
+
+    Args:
+        (none)
+
+    Returns:
+        None - renders directly to the Streamlit page.
+
+    Notes:
+        Both tables are read from the database rather than recomputed: running
+        Engine 1 over 265 stock lines on every page load would make the app
+        unusable on the MINIMAL profile, and the recommendations only change
+        when the underlying demand history does.
+    """
+    st.subheader("Logistics")
+
+    # --- Stock recommendations ---
+    st.markdown("**Recommended stock levels**")
+    if not table_exists("stock_recommendations"):
+        st.info("No stock recommendations yet. Run: python logistics_optimizer.py")
+    else:
+        stock_col = resolve_stock_column()
+        recs = load_table(f"""
+            SELECT sr.station, sr.part_number, pc.description, sr.criticality,
+                   sr.part_class, sr.mean_monthly_demand, sr.std_monthly_demand,
+                   i.{stock_col} AS current_stock, i.minimum_stock_level AS current_min,
+                   sr.optimal_min_stock, sr.optimal_reorder_point,
+                   sr.optimal_max_stock, sr.annual_holding_cost_eur
+            FROM stock_recommendations sr
+            JOIN parts_catalog pc ON sr.part_number = pc.part_number
+            LEFT JOIN inventory i ON i.part_number = sr.part_number
+                                 AND i.station = sr.station
+            ORDER BY CASE sr.criticality WHEN 'AOG' THEN 0 WHEN 'MEL' THEN 1
+                     ELSE 2 END, sr.annual_holding_cost_eur DESC
+        """)
+        recs["current_stock"] = recs["current_stock"].fillna(0)
+        # Positive delta: the recommendation asks for more than is held today.
+        recs["delta"] = recs["optimal_min_stock"] - recs["current_stock"]
+
+        c1, c2, c3, c4 = st.columns(4)
+        stat_tile(c1, "Lines optimised", f"{len(recs)}", "part-station pairs")
+        under = int((recs["delta"] > 0).sum())
+        stat_tile(c2, "Under target", f"{under}", "lines below optimal minimum",
+                  tone="warning" if under else "good")
+        stat_tile(c3, "Over target", f"{int((recs['delta'] < 0).sum())}",
+                  "lines carrying excess")
+        stat_tile(c4, "Annual holding cost",
+                  f"EUR {recs['annual_holding_cost_eur'].sum():,.0f}",
+                  "at the recommended maxima")
+
+        g1, g2 = st.columns([1, 1])
+        sel_crit = g1.multiselect("Criticality", ["AOG", "MEL", "ROUTINE"],
+                                  default=["AOG", "MEL", "ROUTINE"], key="rec_crit")
+        gap_only = g2.toggle("Under-target lines only", value=False, key="rec_gap",
+                             help="Off shows every optimised line, including "
+                                  "those already at or above target.")
+        view = recs[recs["criticality"].isin(sel_crit)]
+        if gap_only:
+            view = view[view["delta"] > 0]
+
+        v = view[["station", "part_number", "description", "criticality",
+                  "mean_monthly_demand", "current_stock", "optimal_min_stock",
+                  "optimal_reorder_point", "optimal_max_stock", "delta",
+                  "annual_holding_cost_eur"]].copy()
+        v.columns = ["Station", "Part", "Description", "Crit", "Demand/month",
+                     "Held", "Opt min", "Reorder", "Opt max", "Delta", "Holding EUR/yr"]
+        st.dataframe(
+            v, width="stretch", hide_index=True, height=340,
+            column_config={
+                "Demand/month": st.column_config.NumberColumn(format="%.2f"),
+                "Holding EUR/yr": st.column_config.NumberColumn(format="%,.0f"),
+                "Delta": st.column_config.NumberColumn(
+                    help="Optimal minimum less stock currently held. Positive "
+                         "means the line is short of its target."),
+            },
+        )
+        st.caption(
+            "Service levels are set by dispatch criticality, not by cost: 99.5% "
+            "for AOG-critical items, 95% for MEL, 85% for routine. Safety stock "
+            "is the z-score for that level times the demand standard deviation "
+            "over the lead time."
+        )
+
+    st.divider()
+
+    # --- Transfers ---
+    st.markdown("**Recommended transfers**")
+    if not table_exists("transfer_recommendations"):
+        st.info("No transfer recommendations yet. Run: python logistics_optimizer.py")
+    else:
+        transfers = load_table("""
+            SELECT criticality, from_station, to_station, part_number,
+                   description, quantity, transfer_hours, reason
+            FROM transfer_recommendations
+            ORDER BY crit_rank, transfer_hours
+        """)
+        if transfers.empty:
+            st.success("No transfers recommended: stock is balanced across the network.")
+        else:
+            t1, t2 = st.columns([2, 3])
+            with t1:
+                st.markdown("**Transfers out, by station**")
+                by_from = transfers.groupby("from_station").size().reset_index(name="count")
+                st.plotly_chart(
+                    ranked_bar(by_from["from_station"], by_from["count"],
+                               "<b>%{y}</b><br>%{x} transfers out<extra></extra>",
+                               height=220),
+                    width="stretch")
+            with t2:
+                st.markdown("**Transfers in, by station**")
+                by_to = transfers.groupby("to_station").size().reset_index(name="count")
+                st.plotly_chart(
+                    ranked_bar(by_to["to_station"], by_to["count"],
+                               "<b>%{y}</b><br>%{x} transfers in<extra></extra>",
+                               height=220),
+                    width="stretch")
+
+            t = transfers.copy()
+            t.columns = ["Criticality", "From", "To", "Part", "Description",
+                         "Qty", "ETA hours", "Reason"]
+            st.dataframe(t, width="stretch", hide_index=True, height=300)
+            st.caption(
+                "Ordered by criticality, then transit time. An AOG-critical part "
+                "that takes 14 hours to move outranks a routine part arriving in 4, "
+                "because the consequence of not moving it is three orders of "
+                "magnitude larger."
+            )
+
+    st.divider()
+
+    # --- AOG simulator ---
+    st.markdown("**AOG response simulator**")
+    st.caption(
+        "Pick a grounded aircraft and the part it needs. Every source in the "
+        "network is ranked by time to availability, with the grounding cost "
+        "that accrues while waiting for it."
+    )
+
+    data = optimizer_tables()
+    if data is None:
+        st.info("The routing engine needs SciPy. Install it with: "
+                "pip install -r requirements.txt")
+        return
+
+    fleet = load_table("SELECT tail_number, home_base FROM fleet ORDER BY tail_number")
+    parts = load_table("""
+        SELECT part_number, description, criticality FROM parts_catalog
+        ORDER BY CASE criticality WHEN 'AOG' THEN 0 WHEN 'MEL' THEN 1 ELSE 2 END,
+                 part_number
+    """)
+    parts["label"] = (parts["part_number"] + " - " + parts["description"]
+                      + " (" + parts["criticality"] + ")")
+
+    s1, s2 = st.columns([1, 2])
+    tail = s1.selectbox("Grounded aircraft", fleet["tail_number"])
+    label = s2.selectbox("Part required", parts["label"])
+    part_number = parts.loc[parts["label"] == label, "part_number"].iloc[0]
+
+    import logistics_optimizer as opt
+    result = opt.route_aog_request(data, tail, part_number)
+    if "error" in result:
+        st.error(result["error"])
+        return
+
+    rec = result["recommended"]
+    options = pd.DataFrame(result["all_options"])
+
+    r1, r2, r3, r4 = st.columns(4)
+    # The recommendation is a state - it is the option that minimises total
+    # cost - so it carries a status tone. Under half an hour is local stock and
+    # effectively a non-event; past a day the aircraft is out of the schedule.
+    tone = ("good" if rec["eta_hours"] <= 1
+            else "warning" if rec["eta_hours"] <= 12 else "critical")
+    stat_tile(r1, "Recommended source", str(rec["source"]),
+              rec["option"].replace("_", " ").title(), tone=tone)
+    stat_tile(r2, "Time to availability", f"{rec['eta_hours']:.1f}h",
+              rec["description"], tone=tone)
+    stat_tile(r3, "Grounding cost", f"EUR {rec['aog_cost_eur']:,.0f}",
+              f"at EUR {opt.AOG_COST_PER_HOUR:,.0f}/hour")
+    stat_tile(r4, "Total cost", f"EUR {rec['total_cost_eur']:,.0f}",
+              f"logistics EUR {rec['cost_eur']:,.0f} plus grounding")
+
+    st.caption(
+        f"{result['part_number']} - {result['part_description']} "
+        f"({result['criticality']}) for {result['aircraft']} at {result['station']}."
+    )
+
+    o1, o2 = st.columns([2, 3])
+    with o1:
+        st.markdown("**Total cost by option**")
+        # Ranked by cost ascending, so the recommendation is the shortest bar.
+        # Cost rather than ETA on the axis because cost is what the two terms
+        # combine into, and the ETA is already in the table beside it.
+        labels = options["source"] + " (" + options["option"].str.replace(
+            "_", " ").str.title() + ")"
+        st.plotly_chart(
+            ranked_bar(labels, options["total_cost_eur"],
+                       "<b>%{y}</b><br>EUR %{x:,.0f} total<extra></extra>",
+                       height=max(200, 60 * len(options))),
+            width="stretch")
+    with o2:
+        st.markdown("**Every option considered**")
+        o = options[["option", "source", "eta_hours", "quantity_available",
+                     "cost_eur", "aog_cost_eur", "total_cost_eur", "description"]].copy()
+        o["option"] = o["option"].str.replace("_", " ").str.title()
+        o.columns = ["Option", "Source", "ETA h", "Available", "Logistics EUR",
+                     "Grounding EUR", "Total EUR", "Detail"]
+        st.dataframe(
+            o, width="stretch", hide_index=True,
+            column_config={
+                "Logistics EUR": st.column_config.NumberColumn(format="%,.0f"),
+                "Grounding EUR": st.column_config.NumberColumn(format="%,.0f"),
+                "Total EUR": st.column_config.NumberColumn(format="%,.0f"),
+                "Available": st.column_config.NumberColumn(
+                    help="Serviceable units at that source. 999 marks supplier "
+                         "stock, which is effectively unbounded."),
+            },
+        )
+        st.caption(
+            "Options are ranked by time to availability, not by cash price. At "
+            "EUR 15,000 per hour on the ground, an hour saved outweighs any "
+            "realistic difference in freight or supplier premium."
+        )
+
+
+# ============================================================================
 # APPLICATION SHELL
 # ============================================================================
 
@@ -1326,6 +1619,7 @@ PAGES = {
     "Fleet Overview": page_fleet,
     "Parts & Inventory": page_parts,
     "Predictions": page_predictions,
+    "Logistics": page_logistics,
 }
 
 
