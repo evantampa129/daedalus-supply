@@ -11,11 +11,12 @@ database without any risk to the record system. Almost every figure it shows
 is already computed and stored by an upstream module; the dashboard's job is
 to make the fleet picture legible at a glance, not to recompute it.
 
-Four views:
+Five views:
     Fleet Overview      the base network on a map, and the aircraft register
     Parts & Inventory   stock against minimum, by part and by station
     Predictions         risk bands, model plots and expendable demand
     Logistics           optimiser output and the AOG response simulator
+    SDR Analysis        real FAA failure evidence, filtered and ranked
 
 Visual conventions (applied consistently across every chart):
     Sequential blue ramp  encodes magnitude (one hue, more-is-darker)
@@ -1612,6 +1613,232 @@ def page_logistics():
 
 
 # ============================================================================
+# PAGE 5: SDR ANALYSIS
+# ============================================================================
+
+# Part-name placeholders used by FAA filers when the field does not apply.
+# They dominate the raw counts without carrying any engineering meaning, so
+# every ranking on this page excludes them - the same exclusion agent.py makes.
+SDR_PLACEHOLDERS = ("UNKNOWN", "NONE", "")
+
+
+def sdr_source() -> str:
+    """
+    Return the SQL source expression for the SDR corpus.
+
+    Args:
+        (none)
+
+    Returns:
+        str - either the table name, or a capped subquery on a machine that
+        config.py classified as MINIMAL.
+
+    Notes:
+        195,801 rows is nothing for SQLite to aggregate on a workstation, but
+        the MINIMAL profile exists for 2 GB machines where it competes with
+        everything else the operator has open. The cap is the same
+        max_sdr_records the training pipeline honours, and the page states
+        plainly when it is in force - a silently sampled statistic is worse
+        than a slow one.
+    """
+    if SDR_SAMPLE_CAP:
+        return f"(SELECT * FROM faa_sdr_raw LIMIT {int(SDR_SAMPLE_CAP)})"
+    return "faa_sdr_raw"
+
+
+def sdr_filter_clause(chapters, makes):
+    """
+    Build the WHERE fragment and bound values for the page's two filters.
+
+    Args:
+        chapters: list - selected ATA chapters, empty for all.
+        makes: list - selected airframe manufacturers, empty for all.
+
+    Returns:
+        tuple (str, list) - the SQL fragment and the values to bind to it.
+
+    Notes:
+        Placeholders are generated from the length of each selection and the
+        values are bound, never interpolated. The selections come from a
+        multiselect populated by the database itself, but they are still user
+        input, and a filter that builds SQL by concatenation is exactly the
+        pattern agent.py was hardened against.
+    """
+    clauses = ["part_name NOT IN (?,?,?)"]
+    values = list(SDR_PLACEHOLDERS)
+
+    if chapters:
+        clauses.append(f"ata_chapter IN ({','.join('?' * len(chapters))})")
+        values.extend(int(c) for c in chapters)
+    if makes:
+        clauses.append(f"acft_make IN ({','.join('?' * len(makes))})")
+        values.extend(makes)
+
+    return " AND ".join(clauses), values
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def sdr_dimensions():
+    """
+    Load the values the SDR filters offer.
+
+    Args:
+        (none)
+
+    Returns:
+        tuple (pd.DataFrame, pd.DataFrame) - ATA chapters and airframe makes,
+        each with a record count, most-reported first.
+    """
+    src = sdr_source()
+    chapters = load_table(f"""
+        SELECT ata_chapter, COUNT(*) AS records FROM {src}
+        WHERE ata_chapter IS NOT NULL
+        GROUP BY ata_chapter ORDER BY records DESC
+    """)
+    makes = load_table(f"""
+        SELECT acft_make, COUNT(*) AS records FROM {src}
+        WHERE acft_make IS NOT NULL AND acft_make != ''
+        GROUP BY acft_make ORDER BY records DESC
+    """)
+    return chapters, makes
+
+
+def page_sdr():
+    """
+    The real FAA Service Difficulty Report corpus, filtered and ranked.
+
+    Args:
+        (none)
+
+    Returns:
+        None - renders directly to the Streamlit page.
+
+    Notes:
+        SDRs are mandatory occurrence reports filed with the FAA. They are the
+        only genuinely observed failure evidence in this system - the fleet,
+        its flight log and its consumption history are all generated - which
+        is why the ATA-chapter distribution here is what anchors the synthetic
+        data to reality.
+    """
+    st.subheader("SDR Analysis")
+
+    if not table_exists("faa_sdr_raw"):
+        st.info("No SDR data. Run data_pipeline.py with the FAA CSV files "
+                "in raw_data/.")
+        return
+
+    src = sdr_source()
+    chapters, makes = sdr_dimensions()
+
+    # --- Filters ---
+    # Above the charts they control, and defaulted to everything: the first
+    # view of this page should be the whole corpus, not an arbitrary slice.
+    f1, f2 = st.columns(2)
+    sel_chapters = f1.multiselect(
+        "ATA chapter", chapters["ata_chapter"].tolist(),
+        format_func=lambda c: f"ATA {int(c)} ({int(chapters.loc[chapters['ata_chapter'] == c, 'records'].iloc[0]):,})",
+        help="Empty means every chapter.")
+    sel_makes = f2.multiselect(
+        "Airframe manufacturer", makes["acft_make"].tolist(),
+        help="Empty means every manufacturer.")
+
+    where, values = sdr_filter_clause(sel_chapters, sel_makes)
+
+    # Cached per distinct filter selection: tuple() because a list is not
+    # hashable and Streamlit hashes the arguments to key the cache.
+    summary = load_table(
+        f"SELECT COUNT(*) AS records, COUNT(DISTINCT part_name) AS parts, "
+        f"COUNT(DISTINCT registration) AS airframes, "
+        f"MIN(report_date) AS first_report, MAX(report_date) AS last_report "
+        f"FROM {src} WHERE {where}", tuple(values))
+    row = summary.iloc[0]
+
+    if not row["records"]:
+        st.info("No reports match this selection.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    stat_tile(c1, "Reports", f"{int(row['records']):,}",
+              "matching the filters above")
+    stat_tile(c2, "Distinct parts", f"{int(row['parts']):,}",
+              "named in the reports")
+    stat_tile(c3, "Airframes", f"{int(row['airframes']):,}",
+              "distinct registrations")
+    stat_tile(c4, "Period",
+              f"{str(row['first_report'])[:4]}-{str(row['last_report'])[:4]}",
+              "first to last report")
+
+    st.divider()
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("**Most-reported parts**")
+        top_parts = load_table(
+            f"SELECT part_name, COUNT(*) AS failures FROM {src} "
+            f"WHERE {where} GROUP BY part_name "
+            f"ORDER BY failures DESC LIMIT 15", tuple(values))
+        st.plotly_chart(
+            ranked_bar(top_parts["part_name"].str.title(), top_parts["failures"],
+                       "<b>%{y}</b><br>%{x:,} reports<extra></extra>", height=420),
+            width="stretch")
+
+    with right:
+        st.markdown("**Failure distribution by ATA chapter**")
+        by_chapter = load_table(
+            f"SELECT ata_chapter, COUNT(*) AS failures FROM {src} "
+            f"WHERE {where} AND ata_chapter IS NOT NULL GROUP BY ata_chapter "
+            f"ORDER BY failures DESC LIMIT 15", tuple(values))
+        st.plotly_chart(
+            ranked_bar("ATA " + by_chapter["ata_chapter"].astype(int).astype(str),
+                       by_chapter["failures"],
+                       "<b>%{y}</b><br>%{x:,} reports<extra></extra>", height=420),
+            width="stretch")
+
+    st.caption(
+        "ATA 53 (fuselage), 33 (lights) and 25 (equipment and furnishings) "
+        "dominate the corpus: structural and cabin findings are raised on every "
+        "check, while a rotable failure has to happen first. The parts catalogue "
+        "in Module 1 is weighted by this distribution."
+    )
+
+    st.divider()
+
+    # --- Detail table ---
+    st.markdown("**Top failure parts**")
+    detail = load_table(
+        f"SELECT part_name, ata_chapter, COUNT(*) AS failures, "
+        f"COUNT(DISTINCT acft_model) AS models, "
+        f"COUNT(DISTINCT registration) AS airframes "
+        f"FROM {src} WHERE {where} AND ata_chapter IS NOT NULL "
+        f"GROUP BY part_name, ata_chapter ORDER BY failures DESC LIMIT 100",
+        tuple(values))
+    d = detail.copy()
+    d["part_name"] = d["part_name"].str.title()
+    d["ata_chapter"] = "ATA " + d["ata_chapter"].astype(int).astype(str)
+    # Share of the filtered corpus, so a reader can tell a genuinely dominant
+    # component from the top of a long flat tail.
+    d["share"] = 100 * d["failures"] / int(row["records"])
+    d.columns = ["Part", "Chapter", "Reports", "Models", "Airframes", "Share %"]
+    st.dataframe(
+        d, width="stretch", hide_index=True, height=360,
+        column_config={
+            "Reports": st.column_config.NumberColumn(format="%,d"),
+            "Share %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Models": st.column_config.NumberColumn(
+                help="Distinct aircraft models the part was reported on."),
+        },
+    )
+
+    if SDR_SAMPLE_CAP:
+        st.warning(
+            f"Hardware profile {CFG['profile']}: these figures are aggregated "
+            f"over the first {int(SDR_SAMPLE_CAP):,} SDR records, not the full "
+            f"corpus. Override with DAEDALUS_PROFILE=STANDARD to use every row."
+        )
+
+
+# ============================================================================
 # APPLICATION SHELL
 # ============================================================================
 
@@ -1620,6 +1847,7 @@ PAGES = {
     "Parts & Inventory": page_parts,
     "Predictions": page_predictions,
     "Logistics": page_logistics,
+    "SDR Analysis": page_sdr,
 }
 
 
@@ -1665,8 +1893,8 @@ def main():
         st.caption(f"Expected at: {DB_PATH}")
         return
 
-    # Sidebar navigation, ordered from fleet-wide context down to the specific
-    # actions the operator can take.
+    # Sidebar navigation. Five views, ordered from fleet-wide context down to
+    # the specific actions the operator can take, with the reference corpus last.
     with st.sidebar:
         st.markdown("### View")
         choice = st.radio("View", list(PAGES.keys()), label_visibility="collapsed")
