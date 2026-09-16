@@ -10,7 +10,7 @@ maintenance history into a stocking and distribution plan.
 Built on EASA/ICAO regulatory structure, trained on real FAA Service Difficulty Report data.
 
 Author: Evangelos Tampachaniotis
-Version: 1.0.0
+Version: 1.1.0
 License: MIT
 
 ---
@@ -59,11 +59,26 @@ License: MIT
         |                     |                     |
         v                     v                     v
    3 PNG plots      stock_recommendations      terminal reports
-                    transfer_recommendations
-                             |
-                             +--> read back by Module 4
+        |           transfer_recommendations
+        |                    |
+        |                    +--> read back by Module 4
+        |                    |
+        +--------+-----------+
+                 |
+                 v
+   +---------------------------------------------------------------+
+   |  MODULE 5 - dashboard.py                    streamlit run      |
+   |                                                                 |
+   |   Fleet Overview     station map, risk bands, register          |
+   |   Parts & Inventory  search, coverage bars, AOG alerts          |
+   |   Predictions        Module 2 plots, risk table, demand         |
+   |   Logistics          Module 3 tables, AOG response simulator    |
+   |   SDR Analysis       195,801 FAA records, filtered and ranked   |
+   |                                                                 |
+   |   Reads aerosupply.db directly - SELECT only, connection ro     |
+   +---------------------------------------------------------------+
 
-   config.py - hardware auto-detection, imported by modules 1-3
+   config.py - hardware auto-detection, imported by modules 1-3 and 5
                MINIMAL / STANDARD / FULL
 ```
 
@@ -129,6 +144,39 @@ python agent.py -i         # interactive prompt
 python agent.py -q "..."   # single query, scriptable
 ```
 
+### Module 5 - Web Dashboard (`dashboard.py`)
+
+Browser front end over the same database. A presentation layer only: it issues SELECT
+statements on a read-only connection and recomputes nothing that an upstream module has
+already written.
+
+| View | Contents |
+|---|---|
+| Fleet Overview | The five Greek stations on a map, marker size by based aircraft and colour by salt exposure. Risk score per airframe, banded LOW / MEDIUM / HIGH, and the full register with sortable columns |
+| Parts & Inventory | AOG-critical shortages as alerts above the fold, search across part number and description, per-station coverage bars against the minimum stock level |
+| Predictions | The three Module 2 plots with their interpretation, per-aircraft risk assessment, and next-month expendable demand against stock on hand |
+| Logistics | Module 3 stock recommendations against stock currently held, recommended transfers with origin and destination, and an AOG response simulator ranking every source by ETA and total cost |
+| SDR Analysis | The FAA corpus filtered by ATA chapter and airframe manufacturer, most-reported parts and the failure distribution |
+
+```
+streamlit run dashboard.py       # http://localhost:8501
+```
+
+Notes on what the dashboard does and does not do:
+
+- The risk score is the screening heuristic `agent.py` reports, reproduced so the two
+  surfaces cannot disagree. The calibrated Cox model stays in Module 2; the dashboard
+  displays its plots rather than refitting it.
+- The expendable forecast is the trailing six-month mean, counting months with no
+  consumption as zero. The XGBoost regressor is not persisted and does not yet beat that
+  baseline on held-out data, so the screen reports the number that is defensible.
+- The AOG simulator calls `logistics_optimizer.route_aog_request` directly. The routing
+  economics live in Module 3 and are not duplicated here.
+- The hardware profile is honoured: on MINIMAL the SDR views aggregate over the capped
+  sample `config.py` allows, and the page says so rather than sampling silently.
+
+Palette follows the browser theme, with a Light / Dark override in the sidebar.
+
 ---
 
 ## Tech Stack
@@ -141,6 +189,7 @@ python agent.py -q "..."   # single query, scriptable
 | Machine learning | XGBoost 2.x, scikit-learn 1.3+ |
 | Statistics | scipy 1.11+ |
 | Plotting | matplotlib 3.7+, seaborn 0.12+ (Agg backend, headless-safe) |
+| Dashboard | Streamlit 1.62+, Plotly 6+ (MapLibre station map) |
 | Storage | SQLite (default), PostgreSQL 14+, MySQL 8+ |
 | ORM / migration | SQLAlchemy 2.x, psycopg2-binary, PyMySQL |
 
@@ -222,7 +271,12 @@ python explore_data.py          # 3. nine sanity-check analyses
 python prediction_model.py      # 4. train the three models, write plots
 python logistics_optimizer.py   # 5. stock levels, transfers, AOG scenarios
 python agent.py                 # 6. query the results
+streamlit run dashboard.py      # 7. the same results in a browser
 ```
+
+The dashboard reads whatever is in the database at the time. Steps 4 and 5 are optional for
+it: without them the prediction plots and the optimiser tables are simply reported as not yet
+generated, with the command that produces them.
 
 ### Agent examples
 
@@ -322,7 +376,7 @@ any figure quoted from the dataset can be regenerated and audited.
 
 ## Security
 
-### Current implementation (v1.0)
+### Current implementation (v1.1)
 
 - SQL injection prevention via allow-list input sanitization (`_safe()`) and parameterized
   queries throughout the agent module
@@ -333,6 +387,11 @@ any figure quoted from the dataset can be regenerated and audited.
 - Input validation: all user-supplied identifiers (tail numbers, part numbers, station codes)
   pass through a strict alphanumeric filter before reaching any query
 - Database backups stored in `backups/`, excluded from version control
+- Read-only dashboard: the Streamlit layer opens SQLite with `mode=ro`, so a write is
+  refused by the driver rather than by code review. Every filter and search term reaches
+  the database as a bound parameter, never as concatenated SQL
+- No credentials in the dashboard: the database location comes from `DAEDALUS_DB_PATH` or
+  defaults to the file beside the module
 
 ### Encryption strategy (deployment guide)
 
@@ -371,10 +430,6 @@ any figure quoted from the dataset can be regenerated and audited.
 ---
 
 ## Roadmap
-
-### v1.1 - Streamlit web dashboard
-
-Fleet map, real-time stock alerts, interactive drill-down into any aircraft, part or station.
 
 ### Access Control Architecture (planned for v1.2+)
 
@@ -446,7 +501,7 @@ R-squared noted below by modelling each part-station series directly rather than
 Full fleet simulation with what-if scenarios and Monte Carlo runs, with reinforcement learning
 optimization of stocking and pre-positioning policy.
 
-### Known limitations in v1.0
+### Known limitations in v1.1
 
 - Demand forecast R-squared is negative. With three years of synthetic history the per-series
   signal is weak and the model does not beat the test-set mean. MAE (0.85 parts/month) is the
@@ -456,6 +511,9 @@ optimization of stocking and pre-positioning policy.
   records is the highest-value improvement available and needs real maintenance history.
 - Transfer costs in the AOG router are a flat rate per transit hour. At EUR 15,000/hour of
   grounding this never changes the ranking, so a detailed freight model was not warranted.
+- The dashboard has no authentication and talks to SQLite directly. It is safe to run on a
+  workstation or behind a trusted network, not to expose. The REST layer in v1.2 and the
+  role enforcement in v1.3 are what make a deployment defensible.
 
 ---
 
@@ -468,6 +526,7 @@ daedalus_supply_ai/
 ├── prediction_model.py       Module 2 - three prediction engines
 ├── logistics_optimizer.py    Module 3 - three optimization engines
 ├── agent.py                  Module 4 - query interface
+├── dashboard.py              Module 5 - Streamlit web dashboard
 ├── explore_data.py           nine standing analyses
 ├── setup_and_test.py         environment verification
 ├── load_to_postgres.py       SQLite -> PostgreSQL / MySQL migration
