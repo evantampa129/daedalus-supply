@@ -10,7 +10,7 @@ maintenance history into a stocking and distribution plan.
 Built on EASA/ICAO regulatory structure, trained on real FAA Service Difficulty Report data.
 
 Author: Evangelos Tampachaniotis
-Version: 1.1.0
+Version: 1.2.0
 License: MIT
 
 ---
@@ -76,6 +76,17 @@ License: MIT
    |   SDR Analysis       195,801 FAA records, filtered and ranked   |
    |                                                                 |
    |   Reads aerosupply.db directly - SELECT only, connection ro     |
+   +---------------------------------------------------------------+
+
+   +---------------------------------------------------------------+
+   |  MODULE 6 - api.py                          uvicorn api:app    |
+   |                                                                 |
+   |   /api/user/*    17 routes  fleet, inventory, predictions,      |
+   |                             logistics, SDR, part requests       |
+   |                             read-only but for the request       |
+   |   /api/admin/*    5 routes  every write in the system           |
+   |                                                                 |
+   |   require_user / require_admin - the seam v1.3 puts JWT into    |
    +---------------------------------------------------------------+
 
    config.py - hardware auto-detection, imported by modules 1-3 and 5
@@ -177,6 +188,50 @@ Notes on what the dashboard does and does not do:
 
 Palette follows the browser theme, with a Light / Dark override in the sidebar.
 
+### Module 6 - REST API (`api.py`)
+
+FastAPI service over the same database, split into two surfaces. The split is
+structural rather than cosmetic: every route depends on `require_user` or
+`require_admin`, which is the single place v1.3 will verify a JWT and a role claim.
+
+| Surface | Routes | Contents |
+|---|---|---|
+| `/api/user/*` | 17 | Fleet register and maintenance history, stations, parts catalogue and stock position, stock alerts, failure risk, expendable demand, stock and transfer recommendations, AOG routing, SDR summary, part requests |
+| `/api/admin/*` | 5 | Add and remove airframes, update stock lines, execute transfers between stations, adopt the optimiser's recommended levels |
+
+```
+uvicorn api:app --reload             # http://127.0.0.1:8000
+python api.py                        # same, binds to localhost by design
+http://127.0.0.1:8000/docs           # interactive OpenAPI browser
+```
+
+The operator tier carries exactly one write: `POST /api/user/part-requests`
+records a demand against an aircraft. It does not decrement, reserve or move
+stock - issuing a part is a stores action and lives in the administrator tier.
+Criticality is taken from the catalogue rather than from the requester, since
+that class is a property of the part under the MEL and it orders every alert
+in the system.
+
+Notes on the implementation:
+
+- Read endpoints open SQLite with `mode=ro`, so a bug in a GET handler cannot
+  write. Write endpoints take a separate connection and commit explicitly;
+  anything that raises first is rolled back, so a half-executed transfer
+  cannot leave units recorded at neither station.
+- The tables were created by pandas and carry no primary keys, unique
+  constraints or foreign keys. Integrity is therefore enforced in the
+  handlers: duplicate registrations, unknown stations, insufficient stock and
+  orphaned maintenance history are each checked before the write runs.
+- Removing an airframe that still has work orders or demands against it is
+  refused by default. Part-M M.A.305 requires that record to be preserved, and
+  the 409 names the counts so the caller can see what they would orphan.
+  Forcing the removal deletes the register row and keeps the history.
+- `POST /api/admin/stock-recommendations/apply` defaults to `dry_run=true`. It
+  can rewrite the stocking parameters of 175 lines in one call, and an
+  operation with that reach should describe itself before it acts.
+- Every write returns the resulting record - the "after" value the audit log
+  in v1.4 will record.
+
 ---
 
 ## Tech Stack
@@ -190,6 +245,7 @@ Palette follows the browser theme, with a Light / Dark override in the sidebar.
 | Statistics | scipy 1.11+ |
 | Plotting | matplotlib 3.7+, seaborn 0.12+ (Agg backend, headless-safe) |
 | Dashboard | Streamlit 1.62+, Plotly 6+ (MapLibre station map) |
+| REST API | FastAPI 0.110+, Pydantic 2.6+, uvicorn 0.27+ |
 | Storage | SQLite (default), PostgreSQL 14+, MySQL 8+ |
 | ORM / migration | SQLAlchemy 2.x, psycopg2-binary, PyMySQL |
 
@@ -272,6 +328,7 @@ python prediction_model.py      # 4. train the three models, write plots
 python logistics_optimizer.py   # 5. stock levels, transfers, AOG scenarios
 python agent.py                 # 6. query the results
 streamlit run dashboard.py      # 7. the same results in a browser
+uvicorn api:app                 # 8. the same results over HTTP
 ```
 
 The dashboard reads whatever is in the database at the time. Steps 4 and 5 are optional for
@@ -376,7 +433,7 @@ any figure quoted from the dataset can be regenerated and audited.
 
 ## Security
 
-### Current implementation (v1.1)
+### Current implementation (v1.2)
 
 - SQL injection prevention via allow-list input sanitization (`_safe()`) and parameterized
   queries throughout the agent module
@@ -392,6 +449,13 @@ any figure quoted from the dataset can be regenerated and audited.
   the database as a bound parameter, never as concatenated SQL
 - No credentials in the dashboard: the database location comes from `DAEDALUS_DB_PATH` or
   defaults to the file beside the module
+- REST API tier separation: `/api/user/*` and `/api/admin/*` sit behind separate dependencies,
+  so authentication in v1.3 is one change per tier rather than one per route
+- The API binds to `127.0.0.1` by default, and `DAEDALUS_API_READONLY=1` removes the
+  administrative router from the application entirely - those routes are then absent from the
+  OpenAPI document, not merely refused
+- Every path, query and body value reaches SQLite as a bound parameter; read endpoints use a
+  `mode=ro` connection so a GET cannot write
 
 ### Encryption strategy (deployment guide)
 
@@ -431,7 +495,7 @@ any figure quoted from the dataset can be regenerated and audited.
 
 ## Roadmap
 
-### Access Control Architecture (planned for v1.2+)
+### Access Control Architecture
 
 The system is designed around two access tiers.
 
@@ -456,7 +520,8 @@ The system is designed around two access tiers.
 
 **Implementation plan**
 
-- **v1.2** - FastAPI REST layer with endpoint separation (`/api/admin/*` and `/api/user/*`)
+- **v1.2** - FastAPI REST layer with endpoint separation (`/api/admin/*` and `/api/user/*`).
+  Shipped.
 - **v1.3** - JWT-based authentication with bcrypt password hashing
 - **v1.4** - Audit logging: every write operation recorded with user ID, timestamp and
   before/after values, per EASA Part-145 145.A.55
@@ -477,11 +542,6 @@ The system is designed around two access tiers.
           [MySQL/PostgreSQL]
 ```
 
-### v1.2 - FastAPI microservices and RBAC endpoint separation
-
-REST API per module with an OpenAPI schema, split into `/api/admin/*` (write operations) and
-`/api/user/*` (read operations) as the structural basis for role-based access control.
-
 ### v1.3 - JWT authentication with bcrypt password hashing
 
 Token-based authentication enforcing the administrator and operator tiers at the auth layer.
@@ -501,7 +561,7 @@ R-squared noted below by modelling each part-station series directly rather than
 Full fleet simulation with what-if scenarios and Monte Carlo runs, with reinforcement learning
 optimization of stocking and pre-positioning policy.
 
-### Known limitations in v1.1
+### Known limitations in v1.2
 
 - Demand forecast R-squared is negative. With three years of synthetic history the per-series
   signal is weak and the model does not beat the test-set mean. MAE (0.85 parts/month) is the
@@ -511,9 +571,18 @@ optimization of stocking and pre-positioning policy.
   records is the highest-value improvement available and needs real maintenance history.
 - Transfer costs in the AOG router are a flat rate per transit hour. At EUR 15,000/hour of
   grounding this never changes the ranking, so a detailed freight model was not warranted.
-- The dashboard has no authentication and talks to SQLite directly. It is safe to run on a
-  workstation or behind a trusted network, not to expose. The REST layer in v1.2 and the
-  role enforcement in v1.3 are what make a deployment defensible.
+- Neither the dashboard nor the API authenticates anything. Both are safe to run on a
+  workstation or behind a trusted network, and neither should be exposed. The API separates
+  the two tiers structurally and binds to localhost; role enforcement arrives in v1.3.
+- The screening risk heuristic bands every airframe HIGH on the reference dataset. Its cut
+  points (8 and 12) were set against the weighted covariates alone, but recorded demand of
+  150-190 parts per aircraft contributes 7.5 to 9.5 points on its own, so every score clears
+  12. The agent, the dashboard and the API all reproduce this faithfully rather than each
+  choosing its own cut points; recalibrating them is a Module 2 change, not three
+  presentation fixes.
+- The API serves the trailing-mean demand baseline rather than the XGBoost regressor. The
+  regressor is not persisted by Module 2 and does not beat that baseline on held-out data;
+  v1.5 addresses both.
 
 ---
 
@@ -527,6 +596,7 @@ daedalus_supply_ai/
 ├── logistics_optimizer.py    Module 3 - three optimization engines
 ├── agent.py                  Module 4 - query interface
 ├── dashboard.py              Module 5 - Streamlit web dashboard
+├── api.py                    Module 6 - FastAPI REST service
 ├── explore_data.py           nine standing analyses
 ├── setup_and_test.py         environment verification
 ├── load_to_postgres.py       SQLite -> PostgreSQL / MySQL migration
