@@ -15,8 +15,7 @@ cosmetic:
     /api/admin/*    what a supply officer or engineering manager needs.
                     Every write in the system lives here.
 
-The fleet and inventory routes are in place; predictions, logistics and the
-administrative surface follow.
+The whole operator surface is in place; the administrative surface follows.
 
 There is no authentication in this version. That is deliberate and it is the
 whole point of shipping the separation first: v1.3 adds JWT and bcrypt, and
@@ -1161,6 +1160,643 @@ def stock_alerts(
         )
 
     return [StockLine(**row) for row in rows]
+
+
+# ============================================================================
+# OPERATOR TIER - PREDICTIONS
+# ============================================================================
+# Module 2 fits the models; this tier serves what they produced. Nothing is
+# refitted per request: training the Cox model and the booster takes minutes,
+# and the answer does not change between two calls a second apart.
+
+class RiskAssessment(BaseModel):
+    """Screening risk for one airframe."""
+
+    tail_number: str
+    home_base: str
+    age_years: Optional[float] = None
+    cycles_per_fh_ratio: Optional[float] = None
+    salt_exposure: Optional[float] = Field(None, description="Chloride load at the home base")
+    recorded_demands: int = Field(0, description="Part demands already raised - observed, not predicted")
+    risk_score: float
+    risk_band: str = Field(..., description="LOW below 8, MEDIUM 8-12, HIGH above 12")
+
+
+class DemandForecast(BaseModel):
+    """Next-month expendable demand for one part at one station."""
+
+    part_number: str
+    station: str
+    description: Optional[str] = None
+    mean_monthly_demand: float = Field(..., description="Trailing six-month mean")
+    forecast_qty: int = Field(..., description="Next month, rounded up to whole units")
+    serviceable: int = Field(..., description="Stock held now")
+    months_cover: Optional[float] = Field(
+        None, description="Stock divided by forecast demand; null when no demand is forecast")
+    under_covered: bool = Field(..., description="Stock below the forecast")
+
+
+# Weights of the screening heuristic. Defined once here and documented as a
+# mirror of agent.py._failure_risk, which is where they were first fitted to
+# the Cox covariates. Three surfaces now answer "which airframe is worst" -
+# the agent, the dashboard and this service - and they have to give the same
+# answer, so the arithmetic is written out in one SQL expression rather than
+# reimplemented per caller.
+RISK_SQL = """
+    SELECT f.tail_number, f.home_base, f.age_years, f.cycles_per_fh_ratio,
+           s.salt_exposure,
+           COUNT(d.part_number) AS recorded_demands,
+           ROUND(f.age_years * 0.3
+                 + f.cycles_per_fh_ratio * 10
+                 + s.salt_exposure * 15
+                 + COUNT(d.part_number) * 0.05, 1) AS risk_score
+    FROM fleet f
+    JOIN stations s ON f.home_base = s.station_code
+    LEFT JOIN part_demands d ON f.tail_number = d.tail_number
+"""
+
+
+def _risk_band(score: float) -> str:
+    """
+    Band a continuous risk score for operational use.
+
+    Args:
+        score: float - the weighted index.
+
+    Returns:
+        str - LOW, MEDIUM or HIGH.
+
+    Notes:
+        Cut points 8 and 12 split the fleet roughly into thirds and keep the
+        HIGH band small enough to act on. A risk list that flags everything
+        flags nothing.
+    """
+    if score > 12:
+        return "HIGH"
+    return "MEDIUM" if score > 8 else "LOW"
+
+
+@user_router.get("/predictions/risk", response_model=List[RiskAssessment], tags=["predictions"])
+def failure_risk(
+    conn: sqlite3.Connection = Depends(read_db),
+    band: Optional[str] = Query(None, description="Filter to LOW / MEDIUM / HIGH"),
+) -> List[RiskAssessment]:
+    """
+    Rank the fleet by screening failure risk, worst first.
+
+    Args:
+        conn: sqlite3.Connection.
+        band: str or None - return only one band.
+
+    Returns:
+        list of RiskAssessment.
+
+    Notes:
+        This is the screening heuristic, not the calibrated model, and the
+        field names say so: risk_score is an index, not a probability and not
+        a remaining-life estimate. The Cox proportional-hazards model that
+        does produce defensible hazard ratios lives in prediction_model.py and
+        needs lifelines to evaluate; exposing it over HTTP means serialising a
+        fitted model, which is v1.3 work at the earliest.
+
+        The whole fleet is 15 rows, so the band filter is applied after
+        scoring rather than in SQL. Scoring first also means the caller gets
+        the same scores whichever band they asked for.
+    """
+    rows = fetch_all(conn, RISK_SQL + " GROUP BY f.tail_number ORDER BY risk_score DESC")
+    out = [RiskAssessment(**row, risk_band=_risk_band(row["risk_score"])) for row in rows]
+    if band:
+        out = [r for r in out if r.risk_band == band.upper()]
+    return out
+
+
+@user_router.get("/predictions/risk/{tail_number}", response_model=RiskAssessment,
+                 tags=["predictions"])
+def failure_risk_for_aircraft(
+    tail_number: str = Path(..., description="Registration, e.g. SX-ABK"),
+    conn: sqlite3.Connection = Depends(read_db),
+) -> RiskAssessment:
+    """
+    Return the screening risk for one airframe.
+
+    Args:
+        tail_number: str - the registration.
+        conn: sqlite3.Connection.
+
+    Returns:
+        RiskAssessment.
+
+    Raises:
+        HTTPException 404 when the registration is unknown.
+
+    Notes:
+        Exists so a client displaying one aircraft does not have to fetch and
+        filter the whole fleet, which is the call a tablet on the ramp makes.
+    """
+    row = fetch_one(conn, RISK_SQL + " WHERE f.tail_number = ? GROUP BY f.tail_number",
+                    (tail_number,))
+    row = require_found(row, f"Aircraft {tail_number}")
+    return RiskAssessment(**row, risk_band=_risk_band(row["risk_score"]))
+
+
+@user_router.get("/predictions/demand", response_model=List[DemandForecast],
+                 tags=["predictions"])
+def expendable_demand(
+    conn: sqlite3.Connection = Depends(read_db),
+    station: Optional[str] = Query(None, description="Restrict to one station"),
+    under_covered: bool = Query(False, description="Only lines whose stock is below the forecast"),
+    limit: int = Query(100, ge=1, le=MAX_LIMIT),
+) -> List[DemandForecast]:
+    """
+    Forecast next-month expendable consumption per part and station.
+
+    Args:
+        conn: sqlite3.Connection.
+        station: str or None - restrict to one station.
+        under_covered: bool - only lines that will not cover the forecast.
+        limit: int - maximum rows.
+
+    Returns:
+        list of DemandForecast, least covered first.
+
+    Notes:
+        The trailing six-month mean, not the XGBoost regressor. The regressor
+        is trained in prediction_model.py and is not persisted, so serving it
+        here would mean either a second copy of the feature pipeline or
+        training on request - and on the current data its held-out R-squared
+        is negative, so it does not beat this baseline. An API that promises a
+        model and returns a worse number than the mean is worse than an API
+        that says which number it is returning.
+
+        Months with no consumption count as real zeros. The window is anchored
+        on the latest month present in the data rather than on the clock, so
+        the endpoint behaves identically against live records and against the
+        generated dataset.
+
+        Six months of history at 15 airframes is a small sample, and the
+        forecast is a planning aid rather than a commitment. v1.5 replaces the
+        baseline with per-series models.
+    """
+    window = fetch_one(conn, """
+        SELECT MIN(month) AS first_month, MAX(month) AS last_month FROM (
+            SELECT DISTINCT substr(demand_date, 1, 7) AS month
+            FROM part_demands ORDER BY month DESC LIMIT 6)
+    """)
+    if not window or not window["last_month"]:
+        return []
+
+    with stock_column(conn) as qty:
+        params: List[Any] = [window["first_month"], window["last_month"]]
+        station_clause = ""
+        if station:
+            station_clause = " AND d.station = ?"
+            params.append(station.upper())
+
+        # Six is the divisor rather than COUNT(DISTINCT month): a part that
+        # was consumed in two of the six months has a mean of two months of
+        # demand spread over six, and dividing by two would report it as a
+        # line that moves every month.
+        rows = fetch_all(conn, f"""
+            SELECT d.part_number, d.station, p.description,
+                   ROUND(SUM(d.quantity_required) / 6.0, 2) AS mean_monthly_demand,
+                   CAST(CASE WHEN SUM(d.quantity_required) % 6 = 0
+                             THEN SUM(d.quantity_required) / 6
+                             ELSE SUM(d.quantity_required) / 6 + 1 END AS INTEGER)
+                        AS forecast_qty,
+                   COALESCE(i.{qty}, 0) AS serviceable
+            FROM part_demands d
+            JOIN parts_catalog p ON d.part_number = p.part_number
+            LEFT JOIN inventory i ON i.part_number = d.part_number
+                                 AND i.station = d.station
+            WHERE p.part_class = 'EXPENDABLE'
+              AND substr(d.demand_date, 1, 7) BETWEEN ? AND ?{station_clause}
+            GROUP BY d.part_number, d.station
+            ORDER BY mean_monthly_demand DESC
+        """, tuple(params))
+
+    out: List[DemandForecast] = []
+    for row in rows:
+        forecast = int(row["forecast_qty"])
+        held = int(row["serviceable"])
+        # Months of cover is the number a planner acts on. A line with no
+        # forecast demand has unbounded cover, reported as null rather than as
+        # a large number a client might sort into the wrong end of a list.
+        cover = round(held / forecast, 1) if forecast > 0 else None
+        entry = DemandForecast(**row, months_cover=cover, under_covered=held < forecast)
+        if not under_covered or entry.under_covered:
+            out.append(entry)
+
+    out.sort(key=lambda e: (e.months_cover if e.months_cover is not None else 99.0))
+    return out[:limit]
+
+
+# ============================================================================
+# OPERATOR TIER - LOGISTICS
+# ============================================================================
+
+class StockRecommendation(BaseModel):
+    """Module 3's recommended levels for one part at one station."""
+
+    part_number: str
+    station: str
+    description: Optional[str] = None
+    criticality: Optional[str] = None
+    part_class: Optional[str] = None
+    mean_monthly_demand: Optional[float] = None
+    std_monthly_demand: Optional[float] = None
+    current_stock: int = Field(0, description="Serviceable units held now")
+    optimal_min_stock: int
+    optimal_reorder_point: int
+    optimal_max_stock: int
+    delta_to_optimal: int = Field(
+        ..., description="Optimal minimum less stock held; positive means short of target")
+    annual_holding_cost_eur: Optional[float] = None
+
+
+class TransferRecommendation(BaseModel):
+    """A pre-positioning move Module 3 recommends."""
+
+    part_number: str
+    description: Optional[str] = None
+    criticality: Optional[str] = None
+    from_station: str
+    to_station: str
+    quantity: int
+    transfer_hours: float = Field(..., description="Door-to-door transit time")
+    reason: Optional[str] = None
+
+
+class AogOption(BaseModel):
+    """One way of getting a part to a grounded aircraft."""
+
+    option: str = Field(..., description="LOCAL_STOCK / STATION_TRANSFER / EMERGENCY_ORDER")
+    source: str = Field(..., description="Station code, or SUPPLIER")
+    eta_hours: float
+    quantity_available: int
+    cost_eur: float = Field(..., description="Logistics cost of this option")
+    aog_cost_eur: float = Field(..., description="Grounding cost accrued while waiting")
+    total_cost_eur: float = Field(..., description="Logistics plus grounding")
+    description: str
+
+
+class AogRoute(BaseModel):
+    """The ranked answer to an AOG request."""
+
+    tail_number: str
+    station: str = Field(..., description="Where the aircraft is")
+    part_number: str
+    part_description: str
+    criticality: str
+    recommended: AogOption
+    options: List[AogOption]
+    aog_cost_per_hour_eur: float = Field(
+        ..., description="The grounding rate every option is priced against")
+
+
+@user_router.get("/logistics/stock-recommendations", response_model=Page[StockRecommendation],
+                 tags=["logistics"])
+def stock_recommendations(
+    conn: sqlite3.Connection = Depends(read_db),
+    station: Optional[str] = Query(None, description="Restrict to one station"),
+    criticality: Optional[str] = Query(None, description="AOG / MEL / ROUTINE"),
+    under_target: bool = Query(False, description="Only lines below their optimal minimum"),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> Page[StockRecommendation]:
+    """
+    Serve the stock levels Module 3 derived from demand history.
+
+    Args:
+        conn: sqlite3.Connection.
+        station: str or None - restrict to one station.
+        criticality: str or None - dispatch class.
+        under_target: bool - only lines short of the recommended minimum.
+        limit: int - page size.
+        offset: int - rows to skip.
+
+    Returns:
+        Page[StockRecommendation].
+
+    Raises:
+        HTTPException 503 when logistics_optimizer.py has not been run.
+
+    Notes:
+        Every row is joined against the stock actually held, because a
+        recommendation alone does not tell a planner whether to raise a
+        purchase order. The delta is computed in SQL so the caller can filter
+        and order on it.
+
+        Service levels behind these numbers are set by dispatch criticality
+        rather than by cost: 99.5% for AOG-critical items, 95% for MEL, 85%
+        for routine. The safety stock is the z-score for that level times the
+        demand standard deviation over the lead time.
+    """
+    if not fetch_one(conn, "SELECT 1 AS ok FROM sqlite_master WHERE type='table' "
+                           "AND name='stock_recommendations'"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No stock recommendations yet. Run: python logistics_optimizer.py")
+
+    with stock_column(conn) as qty:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if station:
+            clauses.append("r.station = ?")
+            params.append(station.upper())
+        if criticality:
+            clauses.append("r.criticality = ?")
+            params.append(criticality.upper())
+        if under_target:
+            clauses.append(f"r.optimal_min_stock > COALESCE(i.{qty}, 0)")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        base_from = f"""
+            FROM stock_recommendations r
+            JOIN parts_catalog p ON r.part_number = p.part_number
+            LEFT JOIN inventory i ON i.part_number = r.part_number
+                                 AND i.station = r.station
+        """
+        return _paginate(
+            conn,
+            f"""SELECT r.part_number, r.station, p.description, r.criticality,
+                       r.part_class, r.mean_monthly_demand, r.std_monthly_demand,
+                       COALESCE(i.{qty}, 0) AS current_stock,
+                       r.optimal_min_stock, r.optimal_reorder_point, r.optimal_max_stock,
+                       r.optimal_min_stock - COALESCE(i.{qty}, 0) AS delta_to_optimal,
+                       r.annual_holding_cost_eur
+                {base_from}{where}
+                ORDER BY CASE r.criticality WHEN 'AOG' THEN 0 WHEN 'MEL' THEN 1 ELSE 2 END,
+                         delta_to_optimal DESC""",
+            f"SELECT COUNT(*) {base_from}{where}",
+            tuple(params), limit, offset, StockRecommendation,
+        )
+
+
+@user_router.get("/logistics/transfers", response_model=List[TransferRecommendation],
+                 tags=["logistics"])
+def transfer_recommendations(
+    conn: sqlite3.Connection = Depends(read_db),
+    from_station: Optional[str] = Query(None, description="Moves out of this station"),
+    to_station: Optional[str] = Query(None, description="Moves into this station"),
+) -> List[TransferRecommendation]:
+    """
+    Serve the pre-positioning moves Module 3 recommends.
+
+    Args:
+        conn: sqlite3.Connection.
+        from_station: str or None - origin filter.
+        to_station: str or None - destination filter.
+
+    Returns:
+        list of TransferRecommendation, most critical and fastest first.
+
+    Raises:
+        HTTPException 503 when logistics_optimizer.py has not been run.
+
+    Notes:
+        Ordered by criticality and then transit time. An AOG-critical part
+        that takes 14 hours to move outranks a routine part arriving in 4,
+        because the consequence of not moving it is three orders of magnitude
+        larger.
+
+        These are recommendations, not instructions: executing one is an
+        administrator action and lives in the admin tier, where it moves
+        stock and is recorded.
+    """
+    if not fetch_one(conn, "SELECT 1 AS ok FROM sqlite_master WHERE type='table' "
+                           "AND name='transfer_recommendations'"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No transfer recommendations yet. Run: python logistics_optimizer.py")
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if from_station:
+        clauses.append("from_station = ?")
+        params.append(from_station.upper())
+    if to_station:
+        clauses.append("to_station = ?")
+        params.append(to_station.upper())
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    rows = fetch_all(conn, f"""
+        SELECT part_number, description, criticality, from_station, to_station,
+               quantity, transfer_hours, reason
+        FROM transfer_recommendations{where}
+        ORDER BY crit_rank, transfer_hours
+    """, tuple(params))
+    return [TransferRecommendation(**row) for row in rows]
+
+
+@user_router.get("/logistics/aog-route", response_model=AogRoute, tags=["logistics"])
+def aog_route(
+    tail_number: str = Query(..., description="Registration of the grounded aircraft"),
+    part_number: str = Query(..., description="Part required"),
+) -> AogRoute:
+    """
+    Rank every source that can get a part to a grounded aircraft.
+
+    Args:
+        tail_number: str - the grounded airframe.
+        part_number: str - the part it needs.
+
+    Returns:
+        AogRoute - the recommendation and every option considered.
+
+    Raises:
+        HTTPException 404 when the aircraft or the part is unknown.
+        HTTPException 503 when SciPy is not installed.
+
+    Notes:
+        A GET, because it computes an answer and changes nothing. Raising an
+        actual request against stock is a different act with a different verb,
+        and it lives in the admin tier.
+
+        The routing itself is logistics_optimizer.route_aog_request, called
+        directly rather than reimplemented. The rules it applies - serviceable
+        stock only, door-to-door transit times, EUR 15,000 per hour of
+        grounding, a 3x premium on an expedited order - are Module 3
+        decisions, and a second copy here would drift from the terminal output
+        the first time either changed.
+
+        Options come back ranked by time to availability rather than by cash
+        price. At EUR 15,000 per hour on the ground, an hour saved outweighs
+        any realistic difference in freight or supplier premium, and the full
+        cost breakdown is returned so the choice can be justified afterwards.
+    """
+    try:
+        import logistics_optimizer as opt
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Routing engine unavailable: {exc}. Install with: "
+                   f"pip install -r requirements.txt") from exc
+
+    result = opt.route_aog_request(opt.load_data(), tail_number, part_number)
+    if "error" in result:
+        # The engine reports an unknown aircraft or part as data so a batch of
+        # scenarios can continue. Over HTTP the same condition is a 404.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result["error"])
+
+    return AogRoute(
+        tail_number=result["aircraft"],
+        station=result["station"],
+        part_number=result["part_number"],
+        part_description=result["part_description"],
+        criticality=result["criticality"],
+        recommended=AogOption(**result["recommended"]),
+        options=[AogOption(**o) for o in result["all_options"]],
+        aog_cost_per_hour_eur=float(opt.AOG_COST_PER_HOUR),
+    )
+
+
+# ============================================================================
+# OPERATOR TIER - SERVICE DIFFICULTY REPORTS
+# ============================================================================
+# The only genuinely observed failure evidence in the system. The fleet, its
+# flight log and its consumption history are all generated; this corpus is
+# what anchors the synthetic data to reality.
+
+# Part-name placeholders used by FAA filers when the field does not apply.
+# They dominate the raw counts without carrying engineering meaning, so every
+# ranking excludes them - the same exclusion agent.py makes.
+SDR_PLACEHOLDERS = ("UNKNOWN", "NONE", "")
+
+# Row cap for constrained machines, from config.py. None on STANDARD and FULL.
+SDR_SAMPLE_CAP = CFG["ml"]["max_sdr_records"]
+
+
+class SdrCount(BaseModel):
+    """One row of an SDR ranking."""
+
+    label: str = Field(..., description="Part name, or ATA chapter")
+    reports: int
+    share_pct: float = Field(..., description="Share of the filtered corpus")
+
+
+class SdrSummary(BaseModel):
+    """Aggregate view of the SDR corpus under a filter."""
+
+    records: int
+    distinct_parts: int
+    airframes: int
+    first_report: Optional[str] = None
+    last_report: Optional[str] = None
+    sampled: bool = Field(
+        ..., description="True when a hardware profile capped the rows aggregated")
+    sample_cap: Optional[int] = None
+    top_parts: List[SdrCount]
+    by_ata_chapter: List[SdrCount]
+
+
+def _sdr_source() -> str:
+    """
+    Return the SQL source expression for the SDR corpus.
+
+    Args:
+        (none)
+
+    Returns:
+        str - the table name, or a capped subquery on a MINIMAL machine.
+
+    Notes:
+        195,801 rows is nothing for SQLite to aggregate on a workstation, but
+        the MINIMAL profile exists for 2 GB machines where this query competes
+        with everything else running. The cap is the same max_sdr_records the
+        training pipeline honours, and the response carries `sampled` so a
+        client is never given a partial statistic that looks complete.
+    """
+    if SDR_SAMPLE_CAP:
+        return f"(SELECT * FROM faa_sdr_raw LIMIT {int(SDR_SAMPLE_CAP)})"
+    return "faa_sdr_raw"
+
+
+@user_router.get("/sdr/summary", response_model=SdrSummary, tags=["sdr"])
+def sdr_summary(
+    conn: sqlite3.Connection = Depends(read_db),
+    ata_chapter: Optional[int] = Query(None, ge=0, le=99, description="Restrict to one chapter"),
+    manufacturer: Optional[str] = Query(None, description="Airframe manufacturer, e.g. AIRBUS"),
+    top: int = Query(15, ge=1, le=100, description="Rows in each ranking"),
+) -> SdrSummary:
+    """
+    Summarise the FAA Service Difficulty Report corpus under a filter.
+
+    Args:
+        conn: sqlite3.Connection.
+        ata_chapter: int or None - restrict to one ATA chapter.
+        manufacturer: str or None - restrict to one airframe manufacturer.
+        top: int - how many rows each ranking returns.
+
+    Returns:
+        SdrSummary - totals, the most-reported parts and the chapter
+        distribution.
+
+    Raises:
+        HTTPException 503 when the corpus has not been loaded.
+
+    Notes:
+        Three aggregates over the same filter are served in one response
+        rather than three endpoints: a client showing this data shows all
+        three together, and splitting them would mean three scans of a
+        195,801-row table where one does.
+
+        Shares are computed against the filtered total, so a genuinely
+        dominant component can be told apart from the top of a long flat tail.
+    """
+    if not fetch_one(conn, "SELECT 1 AS ok FROM sqlite_master WHERE type='table' "
+                           "AND name='faa_sdr_raw'"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No SDR data. Run data_pipeline.py with the FAA CSV files in raw_data/.")
+
+    src = _sdr_source()
+    clauses = ["part_name NOT IN (?,?,?)"]
+    params: List[Any] = list(SDR_PLACEHOLDERS)
+    if ata_chapter is not None:
+        clauses.append("ata_chapter = ?")
+        params.append(ata_chapter)
+    if manufacturer:
+        clauses.append("acft_make = ?")
+        params.append(manufacturer.upper())
+    where = " WHERE " + " AND ".join(clauses)
+
+    totals = fetch_one(conn, f"""
+        SELECT COUNT(*) AS records, COUNT(DISTINCT part_name) AS distinct_parts,
+               COUNT(DISTINCT registration) AS airframes,
+               MIN(report_date) AS first_report, MAX(report_date) AS last_report
+        FROM {src}{where}
+    """, tuple(params)) or {}
+
+    records = int(totals.get("records") or 0)
+    if not records:
+        return SdrSummary(records=0, distinct_parts=0, airframes=0,
+                          sampled=bool(SDR_SAMPLE_CAP), sample_cap=SDR_SAMPLE_CAP,
+                          top_parts=[], by_ata_chapter=[])
+
+    def ranking(column: str, label_prefix: str = "") -> List[SdrCount]:
+        """Aggregate one dimension and express each row as a share."""
+        rows = fetch_all(conn, f"""
+            SELECT {column} AS label, COUNT(*) AS reports
+            FROM {src}{where} AND {column} IS NOT NULL
+            GROUP BY {column} ORDER BY reports DESC LIMIT ?
+        """, tuple(params) + (top,))
+        return [SdrCount(label=f"{label_prefix}{row['label']}",
+                         reports=int(row["reports"]),
+                         share_pct=round(100.0 * int(row["reports"]) / records, 2))
+                for row in rows]
+
+    return SdrSummary(
+        records=records,
+        distinct_parts=int(totals.get("distinct_parts") or 0),
+        airframes=int(totals.get("airframes") or 0),
+        first_report=totals.get("first_report"),
+        last_report=totals.get("last_report"),
+        sampled=bool(SDR_SAMPLE_CAP),
+        sample_cap=SDR_SAMPLE_CAP,
+        # Column names here are literals in this module, never client input.
+        top_parts=ranking("part_name"),
+        by_ata_chapter=ranking("ata_chapter", "ATA "),
+    )
 
 
 # ============================================================================
