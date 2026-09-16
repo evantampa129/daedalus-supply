@@ -15,8 +15,8 @@ cosmetic:
     /api/admin/*    what a supply officer or engineering manager needs.
                     Every write in the system lives here.
 
-Routes arrive per module across the sessions that follow; this one carries
-the shell, the database layer, the access seam and the service metadata.
+The fleet and inventory routes are in place; predictions, logistics and the
+administrative surface follow.
 
 There is no authentication in this version. That is deliberate and it is the
 whole point of shipping the separation first: v1.3 adds JWT and bcrypt, and
@@ -558,13 +558,618 @@ def service_meta(conn: sqlite3.Connection = Depends(read_db)) -> ServiceMeta:
 
 
 # ============================================================================
+# OPERATOR TIER - FLEET
+# ============================================================================
+# Everything under /api/user is what a technician or a line-maintenance
+# engineer needs to do their job. The router carries require_user as a
+# router-level dependency, so a route added later cannot accidentally escape
+# the tier by forgetting to declare it.
+
+user_router = APIRouter(
+    prefix="/api/user",
+    dependencies=[Depends(require_user)],
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+
+
+class Aircraft(BaseModel):
+    """One airframe in the continuing-airworthiness register."""
+
+    tail_number: str = Field(..., description="Registration, e.g. SX-ABK")
+    aircraft_model: str
+    manufacture_year: Optional[int] = None
+    age_years: Optional[float] = None
+    home_base: str = Field(..., description="IATA code of the base station")
+    primary_role: Optional[str] = Field(None, description="short_haul / medium_haul")
+    total_flight_hours: Optional[float] = None
+    total_flight_cycles: Optional[int] = None
+    cycles_per_fh_ratio: Optional[float] = Field(
+        None, description="Cycles per flight hour - the cyclic-stress measure")
+    daily_utilization_fh: Optional[float] = None
+    status: Optional[str] = None
+
+
+class MaintenanceEvent(BaseModel):
+    """A single work order raised against an airframe."""
+
+    work_order_id: str
+    check_type: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    status: Optional[str] = None
+    aircraft_fh_at_check: Optional[float] = None
+    source: Optional[str] = Field(
+        None, description="SCHEDULED / UNSCHEDULED_FAILURE / PILOT_REPORT")
+
+
+class AircraftDetail(Aircraft):
+    """An airframe with the maintenance picture attached."""
+
+    work_orders_total: int = 0
+    work_orders_scheduled: int = 0
+    work_orders_unscheduled: int = Field(
+        0, description="Unscheduled failures and pilot reports together - both "
+                       "are unplanned and differ only in who found the defect")
+    part_demands: int = Field(0, description="Part demands recorded against this airframe")
+    findings: int = Field(0, description="Findings raised against this airframe")
+    salt_exposure: Optional[float] = Field(
+        None, description="Chloride-load index of the home base, 0.0-1.0")
+
+
+class Station(BaseModel):
+    """A base station and the stock it holds."""
+
+    station_code: str
+    name: str
+    climate: Optional[str] = None
+    salt_exposure: Optional[float] = None
+    based_aircraft: int = 0
+    stock_lines: int = Field(0, description="Part-station lines carried at this station")
+    lines_below_minimum: int = 0
+    stock_value_eur: float = 0.0
+
+
+def _paginate(conn: sqlite3.Connection, base_sql: str, count_sql: str,
+              params: tuple, limit: int, offset: int, model: type) -> Page:
+    """
+    Run a filtered query twice: once for the page, once for the total.
+
+    Args:
+        conn: sqlite3.Connection.
+        base_sql: str - the SELECT, without LIMIT or OFFSET.
+        count_sql: str - the matching COUNT over the same FROM and WHERE.
+        params: tuple - bound values shared by both statements.
+        limit: int - page size, already validated by the route signature.
+        offset: int - rows to skip.
+        model: type - the Pydantic model each row is validated into.
+
+    Returns:
+        Page[model] - items plus the size of the full result.
+
+    Notes:
+        The count is a second query rather than a window function so the same
+        code works unchanged against the MySQL 5.7-era deployments the schema
+        still supports. At this data size both statements hit the same indexes
+        and the extra round trip is not measurable.
+    """
+    total = conn.execute(count_sql, params).fetchone()[0]
+    rows = fetch_all(conn, f"{base_sql} LIMIT ? OFFSET ?", params + (limit, offset))
+    return Page[model](total=int(total), limit=limit, offset=offset, items=rows)
+
+
+@user_router.get("/fleet", response_model=Page[Aircraft], tags=["fleet"])
+def list_fleet(
+    conn: sqlite3.Connection = Depends(read_db),
+    home_base: Optional[str] = Query(None, description="Filter by base station code"),
+    primary_role: Optional[str] = Query(None, description="short_haul / medium_haul"),
+    status_filter: Optional[str] = Query(None, alias="status", description="Airframe status"),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> Page[Aircraft]:
+    """
+    List the fleet register, filtered and paged.
+
+    Args:
+        conn: sqlite3.Connection - injected read-only connection.
+        home_base: str or None - restrict to one base station.
+        primary_role: str or None - restrict to one operating role.
+        status_filter: str or None - restrict to one airframe status. Exposed
+            as `status` to the client; renamed in Python because `status` is
+            the FastAPI status-code module imported here.
+        limit: int - page size, 1 to 500.
+        offset: int - rows to skip.
+
+    Returns:
+        Page of Aircraft rows, ordered by accumulated flight hours descending.
+
+    Notes:
+        Ordered by flight hours because that is the axis an engineer scans a
+        fleet on: the highest-time airframe is the one nearest its next heavy
+        check. Filters are composed as bound parameters, never concatenated.
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+    for column, value in (("home_base", home_base), ("primary_role", primary_role),
+                          ("status", status_filter)):
+        if value:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    return _paginate(
+        conn,
+        f"SELECT * FROM fleet{where} ORDER BY total_flight_hours DESC",
+        f"SELECT COUNT(*) FROM fleet{where}",
+        tuple(params), limit, offset, Aircraft,
+    )
+
+
+@user_router.get("/fleet/{tail_number}", response_model=AircraftDetail, tags=["fleet"])
+def get_aircraft(
+    tail_number: str = Path(..., description="Registration, e.g. SX-ABK"),
+    conn: sqlite3.Connection = Depends(read_db),
+) -> AircraftDetail:
+    """
+    Return one airframe with its maintenance and consumption summary.
+
+    Args:
+        tail_number: str - the registration.
+        conn: sqlite3.Connection.
+
+    Returns:
+        AircraftDetail.
+
+    Raises:
+        HTTPException 404 when the registration is unknown.
+
+    Notes:
+        This is the EASA Part-M M.A.305 record for a single aircraft: hours,
+        cycles and every maintenance event raised against it. salt_exposure is
+        joined from the home base because it is the environmental covariate the
+        Cox model in Module 2 found significant (hazard ratio 1.465,
+        p = 0.037), and a client assessing one airframe needs it without a
+        second call to the stations endpoint.
+
+        The counts are subqueries rather than joins: joining three one-to-many
+        tables at once would multiply the rows and require a DISTINCT that
+        costs more than the three scalar lookups.
+    """
+    row = fetch_one(conn, """
+        SELECT f.*, s.salt_exposure,
+               (SELECT COUNT(*) FROM work_orders w
+                 WHERE w.tail_number = f.tail_number) AS work_orders_total,
+               (SELECT COUNT(*) FROM work_orders w
+                 WHERE w.tail_number = f.tail_number
+                   AND w.source = 'SCHEDULED') AS work_orders_scheduled,
+               (SELECT COUNT(*) FROM work_orders w
+                 WHERE w.tail_number = f.tail_number
+                   AND w.source IN ('UNSCHEDULED_FAILURE','PILOT_REPORT'))
+                   AS work_orders_unscheduled,
+               (SELECT COUNT(*) FROM part_demands d
+                 WHERE d.tail_number = f.tail_number) AS part_demands,
+               (SELECT COUNT(*) FROM findings n
+                 WHERE n.tail_number = f.tail_number) AS findings
+        FROM fleet f
+        LEFT JOIN stations s ON f.home_base = s.station_code
+        WHERE f.tail_number = ?
+    """, (tail_number,))
+    return AircraftDetail(**require_found(row, f"Aircraft {tail_number}"))
+
+
+@user_router.get("/fleet/{tail_number}/maintenance",
+                 response_model=Page[MaintenanceEvent], tags=["fleet"])
+def get_aircraft_maintenance(
+    tail_number: str = Path(..., description="Registration, e.g. SX-ABK"),
+    conn: sqlite3.Connection = Depends(read_db),
+    source: Optional[str] = Query(None, description="SCHEDULED / UNSCHEDULED_FAILURE / PILOT_REPORT"),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> Page[MaintenanceEvent]:
+    """
+    Return the work-order history of one airframe, most recent first.
+
+    Args:
+        tail_number: str - the registration.
+        conn: sqlite3.Connection.
+        source: str or None - restrict to one origin of work.
+        limit: int - page size.
+        offset: int - rows to skip.
+
+    Returns:
+        Page of MaintenanceEvent rows.
+
+    Raises:
+        HTTPException 404 when the registration is unknown.
+
+    Notes:
+        The aircraft is verified before the history is read, so an unknown
+        registration returns 404 rather than an empty page that a client
+        cannot tell apart from an airframe with no recorded work.
+    """
+    require_found(fetch_one(conn, "SELECT 1 AS ok FROM fleet WHERE tail_number = ?",
+                            (tail_number,)), f"Aircraft {tail_number}")
+
+    clauses = ["tail_number = ?"]
+    params: List[Any] = [tail_number]
+    if source:
+        clauses.append("source = ?")
+        params.append(source)
+    where = " WHERE " + " AND ".join(clauses)
+
+    return _paginate(
+        conn,
+        f"SELECT work_order_id, check_type, scheduled_date, status, "
+        f"aircraft_fh_at_check, source FROM work_orders{where} "
+        f"ORDER BY scheduled_date DESC",
+        f"SELECT COUNT(*) FROM work_orders{where}",
+        tuple(params), limit, offset, MaintenanceEvent,
+    )
+
+
+@user_router.get("/stations", response_model=List[Station], tags=["fleet"])
+def list_stations(conn: sqlite3.Connection = Depends(read_db)) -> List[Station]:
+    """
+    List the base network with a stock summary per station.
+
+    Args:
+        conn: sqlite3.Connection.
+
+    Returns:
+        list of Station.
+
+    Notes:
+        Five stations, so this endpoint does not page - a limit parameter on a
+        collection that cannot grow past a handful would be ceremony.
+
+        Stock value counts serviceable units only, per Part-145 145.A.42: an
+        unserviceable unit awaiting shop input is an asset on the books but
+        not stock a technician can draw, and reporting it here would overstate
+        what the station can actually dispatch.
+    """
+    with stock_column(conn) as qty:
+        rows = fetch_all(conn, f"""
+            SELECT s.station_code, s.name, s.climate, s.salt_exposure,
+                   (SELECT COUNT(*) FROM fleet f
+                     WHERE f.home_base = s.station_code) AS based_aircraft,
+                   (SELECT COUNT(*) FROM inventory i
+                     WHERE i.station = s.station_code) AS stock_lines,
+                   (SELECT COUNT(*) FROM inventory i
+                     WHERE i.station = s.station_code
+                       AND i.{qty} < i.minimum_stock_level) AS lines_below_minimum,
+                   COALESCE((SELECT SUM(i.{qty} * p.unit_cost_eur)
+                               FROM inventory i
+                               JOIN parts_catalog p ON i.part_number = p.part_number
+                              WHERE i.station = s.station_code), 0) AS stock_value_eur
+            FROM stations s
+            ORDER BY s.station_code
+        """)
+    return [Station(**row) for row in rows]
+
+
+@user_router.get("/stations/{station_code}", response_model=Station, tags=["fleet"])
+def get_station(
+    station_code: str = Path(..., description="IATA code, e.g. HER"),
+    conn: sqlite3.Connection = Depends(read_db),
+) -> Station:
+    """
+    Return one station with its stock summary.
+
+    Args:
+        station_code: str - the IATA code.
+        conn: sqlite3.Connection.
+
+    Returns:
+        Station.
+
+    Raises:
+        HTTPException 404 when the code is unknown.
+
+    Notes:
+        Reuses the list query and filters in Python. The network is five rows;
+        a second parameterised query would be more code for no gain.
+    """
+    code = station_code.upper()
+    match = next((s for s in list_stations(conn) if s.station_code.upper() == code), None)
+    return require_found(match, f"Station {station_code}")
+
+
+# ============================================================================
+# OPERATOR TIER - PARTS AND INVENTORY
+# ============================================================================
+
+class Part(BaseModel):
+    """A catalogue entry."""
+
+    part_number: str
+    description: str
+    ata_chapter: Optional[int] = Field(None, description="ATA/JASC 100 chapter")
+    ata_subchapter: Optional[int] = Field(None, description="ATA subchapter, e.g. 10")
+    part_class: Optional[str] = Field(None, description="ROTABLE / EXPENDABLE / CONSUMABLE")
+    criticality: Optional[str] = Field(None, description="AOG / MEL / ROUTINE")
+    unit_of_measure: Optional[str] = None
+    unit_cost_eur: Optional[float] = None
+    mtbf_flight_hours: Optional[float] = Field(
+        None, description="Null for parts not tracked by MTBF, which is most "
+                          "expendables and consumables")
+    mtbf_flight_cycles: Optional[float] = None
+    lead_time_days_normal: Optional[int] = None
+    lead_time_days_aog: Optional[int] = None
+    shelf_life_months: Optional[int] = None
+
+
+class StockLine(BaseModel):
+    """Stock held for one part at one station."""
+
+    part_number: str
+    station: str
+    description: Optional[str] = None
+    criticality: Optional[str] = None
+    part_class: Optional[str] = None
+    serviceable: int = Field(..., description="Units available to fit (Part-145 145.A.42)")
+    unserviceable: int = Field(0, description="Units awaiting shop input - not available")
+    quantity_on_hand: int = Field(..., description="Serviceable and unserviceable together")
+    minimum_stock_level: int
+    reorder_point: Optional[int] = None
+    below_minimum: bool
+    shortage: int = Field(..., description="Units short of the minimum, 0 when covered")
+    coverage_pct: Optional[float] = Field(
+        None, description="Serviceable stock as a percentage of the minimum level")
+    unit_cost_eur: Optional[float] = None
+    last_receipt_date: Optional[str] = None
+
+
+class PartAvailability(Part):
+    """A catalogue entry with its position across the network."""
+
+    network_serviceable: int = 0
+    network_unserviceable: int = 0
+    stations_stocked: int = Field(0, description="Stations holding at least one serviceable unit")
+    stock: List[StockLine] = Field(default_factory=list)
+
+
+def _stock_select(qty: str) -> str:
+    """
+    Build the SELECT that every stock query in this module shares.
+
+    Args:
+        qty: str - the serviceable-quantity column for the active schema.
+
+    Returns:
+        str - the SELECT and FROM, without a WHERE clause.
+
+    Notes:
+        Shortage and coverage are computed in SQL rather than in Python so
+        that filtering and ordering can use them directly. Coverage divides by
+        the minimum level, so it is guarded: a line with no minimum set is
+        reported as null rather than as a division by zero, and the client is
+        left to decide what "no minimum" means for its own display.
+
+        below_minimum is selected as 0 or 1 because SQLite has no boolean
+        type. StockLine declares it as a bool and Pydantic coerces it, so no
+        call site has to remember to convert it.
+    """
+    return f"""
+        SELECT i.part_number, i.station, p.description, p.criticality, p.part_class,
+               i.{qty} AS serviceable, i.unserviceable, i.quantity_on_hand,
+               i.minimum_stock_level, i.reorder_point,
+               CASE WHEN i.{qty} < i.minimum_stock_level THEN 1 ELSE 0 END AS below_minimum,
+               MAX(i.minimum_stock_level - i.{qty}, 0) AS shortage,
+               CASE WHEN i.minimum_stock_level > 0
+                    THEN ROUND(100.0 * i.{qty} / i.minimum_stock_level, 1)
+                    ELSE NULL END AS coverage_pct,
+               p.unit_cost_eur, i.last_receipt_date
+        FROM inventory i
+        JOIN parts_catalog p ON i.part_number = p.part_number
+    """
+
+
+@user_router.get("/parts", response_model=Page[Part], tags=["inventory"])
+def list_parts(
+    conn: sqlite3.Connection = Depends(read_db),
+    q: Optional[str] = Query(None, min_length=1, max_length=64,
+                             description="Match against part number or description"),
+    criticality: Optional[str] = Query(None, description="AOG / MEL / ROUTINE"),
+    part_class: Optional[str] = Query(None, description="ROTABLE / EXPENDABLE / CONSUMABLE"),
+    ata_chapter: Optional[int] = Query(None, ge=0, le=99, description="ATA/JASC chapter"),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> Page[Part]:
+    """
+    Search the parts catalogue.
+
+    Args:
+        conn: sqlite3.Connection.
+        q: str or None - free text matched against number and description.
+        criticality: str or None - dispatch class.
+        part_class: str or None - rotable, expendable or consumable.
+        ata_chapter: int or None - ATA chapter.
+        limit: int - page size.
+        offset: int - rows to skip.
+
+    Returns:
+        Page of Part rows, most dispatch-critical first.
+
+    Notes:
+        One search field matched against both the number and the description,
+        because an engineer holding a removed unit has the number and an
+        engineer reading a defect report has the words.
+
+        The LIKE pattern is bound as a parameter with the wildcards added to
+        the value, not to the statement. A search for "50%" is therefore a
+        search for the characters 5, 0 and % rather than a pattern the client
+        can widen at will.
+    """
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    if q:
+        clauses.append("(part_number LIKE ? OR description LIKE ?)")
+        pattern = f"%{q}%"
+        params.extend([pattern, pattern])
+    for column, value in (("criticality", criticality), ("part_class", part_class)):
+        if value:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    if ata_chapter is not None:
+        clauses.append("ata_chapter = ?")
+        params.append(ata_chapter)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    return _paginate(
+        conn,
+        f"SELECT * FROM parts_catalog{where} ORDER BY {CRIT_ORDER_SQL}, part_number",
+        f"SELECT COUNT(*) FROM parts_catalog{where}",
+        tuple(params), limit, offset, Part,
+    )
+
+
+@user_router.get("/parts/{part_number}", response_model=PartAvailability, tags=["inventory"])
+def get_part(
+    part_number: str = Path(..., description="Catalogue number, e.g. AES-24-10-001"),
+    conn: sqlite3.Connection = Depends(read_db),
+) -> PartAvailability:
+    """
+    Return a catalogue entry with its availability at every station.
+
+    Args:
+        part_number: str - the catalogue number.
+        conn: sqlite3.Connection.
+
+    Returns:
+        PartAvailability - the part, its network totals and its stock lines.
+
+    Raises:
+        HTTPException 404 when the part is unknown.
+
+    Notes:
+        This is the call a technician makes with a part number in hand, and it
+        answers the only question that matters at that moment: where in the
+        network is one, and is it serviceable. Network totals count
+        serviceable units alone; the unserviceable figure is reported beside
+        them rather than folded in.
+    """
+    part = require_found(
+        fetch_one(conn, "SELECT * FROM parts_catalog WHERE part_number = ?", (part_number,)),
+        f"Part {part_number}")
+
+    with stock_column(conn) as qty:
+        lines = fetch_all(conn, _stock_select(qty) + " WHERE i.part_number = ? "
+                                "ORDER BY i.station", (part_number,))
+
+    return PartAvailability(
+        **part,
+        network_serviceable=sum(int(r["serviceable"]) for r in lines),
+        network_unserviceable=sum(int(r["unserviceable"] or 0) for r in lines),
+        stations_stocked=sum(1 for r in lines if int(r["serviceable"]) > 0),
+        stock=[StockLine(**r) for r in lines],
+    )
+
+
+@user_router.get("/inventory", response_model=Page[StockLine], tags=["inventory"])
+def list_inventory(
+    conn: sqlite3.Connection = Depends(read_db),
+    station: Optional[str] = Query(None, description="Restrict to one station"),
+    criticality: Optional[str] = Query(None, description="AOG / MEL / ROUTINE"),
+    below_minimum: bool = Query(False, description="Only lines below their minimum level"),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> Page[StockLine]:
+    """
+    List stock lines across the network.
+
+    Args:
+        conn: sqlite3.Connection.
+        station: str or None - restrict to one station.
+        criticality: str or None - dispatch class.
+        below_minimum: bool - restrict to shortages.
+        limit: int - page size.
+        offset: int - rows to skip.
+
+    Returns:
+        Page of StockLine rows, most critical and least covered first.
+
+    Notes:
+        Ordering is criticality, then coverage ascending: the first page is
+        always the lines closest to grounding an aircraft, whatever filters
+        the client applied.
+    """
+    with stock_column(conn) as qty:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if station:
+            clauses.append("i.station = ?")
+            params.append(station.upper())
+        if criticality:
+            clauses.append("p.criticality = ?")
+            params.append(criticality.upper())
+        if below_minimum:
+            clauses.append(f"i.{qty} < i.minimum_stock_level")
+
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        order = (f" ORDER BY CASE p.criticality WHEN 'AOG' THEN 0 WHEN 'MEL' THEN 1 "
+                 f"ELSE 2 END, coverage_pct IS NULL, coverage_pct, shortage DESC")
+
+        return _paginate(
+            conn,
+            _stock_select(qty) + where + order,
+            f"SELECT COUNT(*) FROM inventory i "
+            f"JOIN parts_catalog p ON i.part_number = p.part_number{where}",
+            tuple(params), limit, offset, StockLine,
+        )
+
+
+@user_router.get("/inventory/alerts", response_model=List[StockLine], tags=["inventory"])
+def stock_alerts(
+    conn: sqlite3.Connection = Depends(read_db),
+    station: Optional[str] = Query(None, description="Restrict to one station"),
+    limit: int = Query(100, ge=1, le=MAX_LIMIT),
+) -> List[StockLine]:
+    """
+    Return every line below its minimum stock level, worst first.
+
+    Args:
+        conn: sqlite3.Connection.
+        station: str or None - restrict to one station, which is what a
+            station's own display asks for.
+        limit: int - maximum alerts returned.
+
+    Returns:
+        list of StockLine, AOG-critical first and largest shortage first.
+
+    Notes:
+        This is the endpoint a dashboard or a tablet polls, so it returns a
+        plain list rather than a page: an alert feed that arrives in pages
+        invites a client to render the first page and quietly drop the rest,
+        and the dropped ones would be the least critical only by luck.
+
+        An AOG-critical line below minimum is the one alert in this system
+        with a direct cost attached - roughly EUR 15,000 per hour of grounding
+        if it is needed before it is replenished.
+    """
+    with stock_column(conn) as qty:
+        clauses = [f"i.{qty} < i.minimum_stock_level"]
+        params: List[Any] = []
+        if station:
+            clauses.append("i.station = ?")
+            params.append(station.upper())
+
+        rows = fetch_all(
+            conn,
+            _stock_select(qty) + " WHERE " + " AND ".join(clauses) +
+            " ORDER BY CASE p.criticality WHEN 'AOG' THEN 0 WHEN 'MEL' THEN 1 "
+            "ELSE 2 END, shortage DESC LIMIT ?",
+            tuple(params) + (limit,),
+        )
+
+    return [StockLine(**row) for row in rows]
+
+
+# ============================================================================
 # ROUTER REGISTRATION
 # ============================================================================
 # Registered last, after every route is defined, so the OpenAPI document is
 # assembled from routes that are all in place.
 
-# No routers yet: this session carries the shell, the database layer and the
-# access seam. Each module's routes are registered here as they are built.
+app.include_router(user_router)
 
 
 # ============================================================================
