@@ -15,8 +15,6 @@ cosmetic:
     /api/admin/*    what a supply officer or engineering manager needs.
                     Every write in the system lives here.
 
-The whole operator surface is in place; the administrative surface follows.
-
 There is no authentication in this version. That is deliberate and it is the
 whole point of shipping the separation first: v1.3 adds JWT and bcrypt, and
 when it does, the only change required is the body of require_admin() and
@@ -1800,12 +1798,643 @@ def sdr_summary(
 
 
 # ============================================================================
+# OPERATOR TIER - PART REQUESTS
+# ============================================================================
+# The single write available to the operator tier, and the boundary is exact:
+# raising a request records a demand. It does not decrement stock, reserve a
+# unit or move anything. Issuing the part is a stores action and belongs to
+# the administrator tier, which is what the access model in the README says.
+
+class PartRequestCreate(BaseModel):
+    """A request for a part, raised by maintenance staff."""
+
+    tail_number: str = Field(..., min_length=3, max_length=16,
+                             description="Aircraft the part is for")
+    part_number: str = Field(..., min_length=3, max_length=32)
+    quantity: int = Field(1, ge=1, le=99, description="Units required")
+    station: Optional[str] = Field(
+        None, min_length=3, max_length=4,
+        description="Where the part is needed. Defaults to the aircraft's home base.")
+    notes: Optional[str] = Field(None, max_length=200,
+                                 description="Free text, recorded with the demand")
+
+    @field_validator("tail_number", "part_number", "station")
+    @classmethod
+    def strip_and_upper(cls, value: Optional[str]) -> Optional[str]:
+        """
+        Normalise identifiers before they reach a query.
+
+        Args:
+            value: str or None - the submitted identifier.
+
+        Returns:
+            str or None - trimmed and upper-cased.
+
+        Notes:
+            Registrations, part numbers and station codes are upper case
+            throughout this system. Normalising at the edge means "sx-abk"
+            from a tablet keyboard resolves rather than 404s, and it happens
+            once here instead of in every handler.
+        """
+        return value.strip().upper() if isinstance(value, str) else value
+
+
+class PartRequest(BaseModel):
+    """A recorded part request."""
+
+    request_id: str = Field(..., description="Reference to quote to stores")
+    tail_number: str
+    part_number: str
+    description: Optional[str] = None
+    quantity: int
+    station: str
+    criticality: Optional[str] = None
+    demand_date: str
+    demand_type: str = Field(..., description="REQUEST - raised by staff, not by a finding")
+
+
+@user_router.post("/part-requests", response_model=PartRequest,
+                  status_code=status.HTTP_201_CREATED, tags=["requests"])
+def create_part_request(
+    request: PartRequestCreate,
+    conn: sqlite3.Connection = Depends(write_db),
+) -> PartRequest:
+    """
+    Record a part request against an aircraft.
+
+    Args:
+        request: PartRequestCreate - the submitted request.
+        conn: sqlite3.Connection - writable connection; committed by the
+            dependency when the handler returns.
+
+    Returns:
+        PartRequest - the recorded demand, including its reference.
+
+    Raises:
+        HTTPException 404 when the aircraft or the part is unknown.
+
+    Notes:
+        Writes one row to part_demands and nothing else. Inventory is
+        untouched, deliberately: a request is a statement of need, and letting
+        a read-tier caller decrement stock would make the tier separation
+        decorative.
+
+        Criticality is taken from the catalogue rather than from the client. A
+        requester does not get to declare their own request AOG - that class
+        is a property of the part under the MEL, and it drives how every alert
+        in this system is ordered.
+
+        demand_type is REQUEST, a value the pipeline does not generate. The
+        column has no CHECK constraint, and distinguishing staff-raised demand
+        from demand derived from a finding is what makes the row auditable
+        when v1.4 adds the audit log.
+    """
+    aircraft = require_found(
+        fetch_one(conn, "SELECT tail_number, home_base FROM fleet WHERE tail_number = ?",
+                  (request.tail_number,)),
+        f"Aircraft {request.tail_number}")
+    part = require_found(
+        fetch_one(conn, "SELECT part_number, description, criticality FROM parts_catalog "
+                        "WHERE part_number = ?", (request.part_number,)),
+        f"Part {request.part_number}")
+
+    station = request.station or aircraft["home_base"]
+    demand_date = date.today().isoformat()
+
+    # Reference built from the date and the count of requests already raised
+    # today. The table has no autoincrement key - it was created by pandas -
+    # so the identifier is generated here, in the same transaction as the
+    # insert, which is what keeps it unique under the single-writer model
+    # SQLite enforces.
+    today_count = conn.execute(
+        "SELECT COUNT(*) FROM part_demands WHERE demand_type = 'REQUEST' AND demand_date = ?",
+        (demand_date,)).fetchone()[0]
+    request_id = f"REQ-{demand_date.replace('-', '')}-{today_count + 1:04d}"
+
+    conn.execute("""
+        INSERT INTO part_demands (finding_id, work_order_id, tail_number, part_number,
+                                  quantity_required, demand_type, demand_date,
+                                  station, criticality)
+        VALUES (?, NULL, ?, ?, ?, 'REQUEST', ?, ?, ?)
+    """, (request_id, request.tail_number, request.part_number, request.quantity,
+          demand_date, station, part["criticality"]))
+
+    return PartRequest(
+        request_id=request_id,
+        tail_number=request.tail_number,
+        part_number=request.part_number,
+        description=part["description"],
+        quantity=request.quantity,
+        station=station,
+        criticality=part["criticality"],
+        demand_date=demand_date,
+        demand_type="REQUEST",
+    )
+
+
+@user_router.get("/part-requests", response_model=Page[PartRequest], tags=["requests"])
+def list_part_requests(
+    conn: sqlite3.Connection = Depends(read_db),
+    station: Optional[str] = Query(None, description="Restrict to one station"),
+    tail_number: Optional[str] = Query(None, description="Restrict to one airframe"),
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+) -> Page[PartRequest]:
+    """
+    List requests raised through this service, most recent first.
+
+    Args:
+        conn: sqlite3.Connection.
+        station: str or None - restrict to one station.
+        tail_number: str or None - restrict to one airframe.
+        limit: int - page size.
+        offset: int - rows to skip.
+
+    Returns:
+        Page[PartRequest].
+
+    Notes:
+        Filtered to demand_type = 'REQUEST', so this returns what staff
+        raised and not the 2,130 demand rows the pipeline generated from
+        findings. A technician checking whether their request was recorded
+        does not want the fleet's entire consumption history.
+    """
+    clauses = ["d.demand_type = 'REQUEST'"]
+    params: List[Any] = []
+    if station:
+        clauses.append("d.station = ?")
+        params.append(station.upper())
+    if tail_number:
+        clauses.append("d.tail_number = ?")
+        params.append(tail_number.upper())
+    where = " WHERE " + " AND ".join(clauses)
+
+    return _paginate(
+        conn,
+        f"""SELECT d.finding_id AS request_id, d.tail_number, d.part_number,
+                   p.description, d.quantity_required AS quantity, d.station,
+                   d.criticality, d.demand_date, d.demand_type
+            FROM part_demands d
+            LEFT JOIN parts_catalog p ON d.part_number = p.part_number
+            {where} ORDER BY d.demand_date DESC, d.finding_id DESC""",
+        f"SELECT COUNT(*) FROM part_demands d{where}",
+        tuple(params), limit, offset, PartRequest,
+    )
+
+
+# ============================================================================
+# ADMINISTRATOR TIER
+# ============================================================================
+# Every write in the system, behind one router and one dependency. The
+# separation is the point of this version: when v1.3 puts JWT verification
+# inside require_admin, this entire surface becomes authenticated in one
+# change, and no route can have been missed because no route declares its own
+# access rule.
+#
+# The tables these handlers write were created by pandas and carry no primary
+# keys, no unique constraints and no foreign keys. Integrity is therefore
+# enforced here, explicitly, rather than assumed from the store: every write
+# checks for the row it would duplicate or orphan before it runs.
+
+admin_router = APIRouter(
+    prefix="/api/admin",
+    dependencies=[Depends(require_admin)],
+    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse},
+               503: {"model": ErrorResponse}},
+)
+
+
+class AircraftCreate(BaseModel):
+    """A new airframe for the register."""
+
+    tail_number: str = Field(..., min_length=3, max_length=16, examples=["SX-ABZ"])
+    aircraft_model: str = Field(..., min_length=2, max_length=40, examples=["A320-214"])
+    manufacture_year: int = Field(..., ge=1960, le=2100)
+    home_base: str = Field(..., min_length=3, max_length=4, examples=["ATH"])
+    primary_role: str = Field("short_haul", description="short_haul / medium_haul")
+    total_flight_hours: float = Field(0, ge=0)
+    total_flight_cycles: int = Field(0, ge=0)
+    daily_utilization_fh: float = Field(8.0, gt=0, le=24)
+    status: str = Field("ACTIVE", description="ACTIVE / STORED / RETIRED")
+
+    @field_validator("tail_number", "home_base")
+    @classmethod
+    def upper(cls, value: str) -> str:
+        """Normalise identifiers, as the operator tier does."""
+        return value.strip().upper()
+
+
+class InventoryUpdate(BaseModel):
+    """A change to one stock line. Every field is optional; omitted means unchanged."""
+
+    serviceable: Optional[int] = Field(None, ge=0, description="Units available to fit")
+    unserviceable: Optional[int] = Field(None, ge=0, description="Units awaiting shop input")
+    minimum_stock_level: Optional[int] = Field(None, ge=0)
+    reorder_point: Optional[int] = Field(None, ge=0)
+    last_receipt_date: Optional[str] = Field(None, description="ISO date of the last receipt")
+
+
+class TransferExecute(BaseModel):
+    """Execution of a stock movement between two stations."""
+
+    part_number: str = Field(..., min_length=3, max_length=32)
+    from_station: str = Field(..., min_length=3, max_length=4)
+    to_station: str = Field(..., min_length=3, max_length=4)
+    quantity: int = Field(..., ge=1, le=999)
+
+    @field_validator("part_number", "from_station", "to_station")
+    @classmethod
+    def upper(cls, value: str) -> str:
+        """Normalise identifiers before they reach a query."""
+        return value.strip().upper()
+
+
+class ApplyRecommendations(BaseModel):
+    """Adoption of Module 3's recommended levels into the live stock parameters."""
+
+    station: Optional[str] = Field(None, description="Limit to one station")
+    criticality: Optional[str] = Field(None, description="Limit to one dispatch class")
+    dry_run: bool = Field(True, description="Report what would change without changing it")
+
+
+@admin_router.post("/fleet", response_model=Acknowledgement,
+                   status_code=status.HTTP_201_CREATED, tags=["admin"])
+def add_aircraft(
+    aircraft: AircraftCreate,
+    conn: sqlite3.Connection = Depends(write_db),
+) -> Acknowledgement:
+    """
+    Add an airframe to the continuing-airworthiness register.
+
+    Args:
+        aircraft: AircraftCreate - the new airframe.
+        conn: sqlite3.Connection - writable, committed on return.
+
+    Returns:
+        Acknowledgement carrying the stored row.
+
+    Raises:
+        HTTPException 409 when the registration already exists.
+        HTTPException 404 when the home base is not a known station.
+
+    Notes:
+        Age and the cycles-per-hour ratio are derived here rather than
+        accepted from the client: both are functions of values already
+        submitted, and a register where a stated age disagrees with the
+        manufacture year is a record that cannot be relied on.
+
+        The duplicate check is an explicit SELECT because the table has no
+        unique constraint to violate. Under SQLite's single-writer model the
+        check and the insert are in the same transaction, so the window
+        between them is not one another writer can use.
+    """
+    if fetch_one(conn, "SELECT 1 AS ok FROM fleet WHERE tail_number = ?",
+                 (aircraft.tail_number,)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Aircraft {aircraft.tail_number} is already on the register")
+
+    require_found(fetch_one(conn, "SELECT 1 AS ok FROM stations WHERE station_code = ?",
+                            (aircraft.home_base,)), f"Station {aircraft.home_base}")
+
+    age_years = max(0, date.today().year - aircraft.manufacture_year)
+    # Cycles per flight hour is the cyclic-stress measure the risk heuristic
+    # and the Cox model both read. A new airframe with no hours yet has no
+    # ratio, which is null rather than a misleading zero.
+    ratio = (round(aircraft.total_flight_cycles / aircraft.total_flight_hours, 3)
+             if aircraft.total_flight_hours else None)
+
+    conn.execute("""
+        INSERT INTO fleet (tail_number, aircraft_model, manufacture_year, age_years,
+                           home_base, primary_role, total_flight_hours,
+                           total_flight_cycles, cycles_per_fh_ratio,
+                           daily_utilization_fh, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (aircraft.tail_number, aircraft.aircraft_model, aircraft.manufacture_year,
+          age_years, aircraft.home_base, aircraft.primary_role,
+          aircraft.total_flight_hours, aircraft.total_flight_cycles, ratio,
+          aircraft.daily_utilization_fh, aircraft.status))
+
+    return Acknowledgement(
+        message=f"Aircraft {aircraft.tail_number} added to the register",
+        record=fetch_one(conn, "SELECT * FROM fleet WHERE tail_number = ?",
+                         (aircraft.tail_number,)),
+    )
+
+
+@admin_router.delete("/fleet/{tail_number}", response_model=Acknowledgement, tags=["admin"])
+def remove_aircraft(
+    tail_number: str = Path(..., description="Registration to remove"),
+    force: bool = Query(False, description="Remove even when maintenance history exists"),
+    conn: sqlite3.Connection = Depends(write_db),
+) -> Acknowledgement:
+    """
+    Remove an airframe from the register.
+
+    Args:
+        tail_number: str - the registration.
+        force: bool - proceed despite dependent records.
+        conn: sqlite3.Connection - writable, committed on return.
+
+    Returns:
+        Acknowledgement carrying the row as it was before removal.
+
+    Raises:
+        HTTPException 404 when the registration is unknown.
+        HTTPException 409 when work orders or demands reference it and force
+            was not set.
+
+    Notes:
+        Refusing by default is the point. Part-M M.A.305 requires the
+        continuing-airworthiness record to be preserved, and deleting the
+        register row while 1,977 work orders still reference the tail number
+        leaves history that cannot be attributed to an aircraft. The 409 names
+        the counts so the caller can see what they are about to orphan.
+
+        Even with force, only the register row is deleted - the history is
+        left intact. Destroying maintenance records is not an operation this
+        API offers at any tier.
+    """
+    existing = require_found(
+        fetch_one(conn, "SELECT * FROM fleet WHERE tail_number = ?", (tail_number.upper(),)),
+        f"Aircraft {tail_number}")
+
+    work_orders = conn.execute("SELECT COUNT(*) FROM work_orders WHERE tail_number = ?",
+                               (tail_number.upper(),)).fetchone()[0]
+    demands = conn.execute("SELECT COUNT(*) FROM part_demands WHERE tail_number = ?",
+                           (tail_number.upper(),)).fetchone()[0]
+
+    if (work_orders or demands) and not force:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(f"Aircraft {tail_number.upper()} has {work_orders} work orders and "
+                    f"{demands} part demands on record. Removing the register entry would "
+                    f"orphan them (Part-M M.A.305). Repeat with force=true to remove the "
+                    f"register entry and keep the history."))
+
+    conn.execute("DELETE FROM fleet WHERE tail_number = ?", (tail_number.upper(),))
+    return Acknowledgement(
+        message=(f"Aircraft {tail_number.upper()} removed from the register; "
+                 f"{work_orders} work orders and {demands} demands retained"),
+        record=existing,
+    )
+
+
+@admin_router.patch("/inventory/{part_number}/{station}", response_model=Acknowledgement,
+                    tags=["admin"])
+def update_stock_line(
+    update: InventoryUpdate,
+    part_number: str = Path(..., description="Catalogue number"),
+    station: str = Path(..., description="Station code"),
+    conn: sqlite3.Connection = Depends(write_db),
+) -> Acknowledgement:
+    """
+    Update the quantities or stock parameters of one line.
+
+    Args:
+        update: InventoryUpdate - the fields to change.
+        part_number: str - catalogue number.
+        station: str - station code.
+        conn: sqlite3.Connection - writable, committed on return.
+
+    Returns:
+        Acknowledgement carrying the line as it now stands.
+
+    Raises:
+        HTTPException 404 when the line does not exist.
+        HTTPException 422 when no field was supplied.
+
+    Notes:
+        PATCH rather than PUT: a stores clerk correcting a serviceable count
+        after a stock check should not have to restate the minimum level and
+        the reorder point, and a partial PUT that silently nulled them would
+        be a data-loss bug waiting to happen.
+
+        quantity_on_hand is derived, never accepted: it is serviceable plus
+        unserviceable by definition, and letting a client set all three
+        independently would allow a line that does not add up.
+
+        The response carries the resulting row. That is the "after" value the
+        audit log in v1.4 records, which is why every write in this tier
+        returns one.
+    """
+    fields = update.model_dump(exclude_none=True)
+    if not fields:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="No fields supplied; nothing to update")
+
+    part_number, station = part_number.upper(), station.upper()
+
+    with stock_column(conn) as qty:
+        current = require_found(
+            fetch_one(conn, "SELECT * FROM inventory WHERE part_number = ? AND station = ?",
+                      (part_number, station)),
+            f"Stock line {part_number} at {station}")
+
+        # Column names are keys of a model defined in this module, mapped to
+        # the active schema's name for the serviceable column. No client
+        # string is ever interpolated into the statement.
+        column_map = {"serviceable": qty, "unserviceable": "unserviceable",
+                      "minimum_stock_level": "minimum_stock_level",
+                      "reorder_point": "reorder_point",
+                      "last_receipt_date": "last_receipt_date"}
+        assignments = [f"{column_map[name]} = ?" for name in fields]
+        values: List[Any] = list(fields.values())
+
+        serviceable = fields.get("serviceable", current[qty])
+        unserviceable = fields.get("unserviceable", current["unserviceable"])
+        assignments.append("quantity_on_hand = ?")
+        values.append(int(serviceable) + int(unserviceable))
+
+        conn.execute(
+            f"UPDATE inventory SET {', '.join(assignments)} "
+            f"WHERE part_number = ? AND station = ?",
+            tuple(values) + (part_number, station))
+
+        updated = fetch_one(conn, "SELECT * FROM inventory WHERE part_number = ? "
+                                  "AND station = ?", (part_number, station))
+
+    return Acknowledgement(message=f"Stock line {part_number} at {station} updated",
+                           record=updated)
+
+
+@admin_router.post("/transfers/execute", response_model=Acknowledgement, tags=["admin"])
+def execute_transfer(
+    transfer: TransferExecute,
+    conn: sqlite3.Connection = Depends(write_db),
+) -> Acknowledgement:
+    """
+    Move serviceable units between two stations.
+
+    Args:
+        transfer: TransferExecute - part, origin, destination and quantity.
+        conn: sqlite3.Connection - writable, committed on return.
+
+    Returns:
+        Acknowledgement carrying both stock lines as they now stand.
+
+    Raises:
+        HTTPException 404 when either stock line does not exist.
+        HTTPException 409 when the origin holds too few serviceable units, or
+            when origin and destination are the same station.
+
+    Notes:
+        This is the one operation in the API that moves physical stock, and it
+        is the reason the tier separation exists at all.
+
+        Only serviceable units move. An unserviceable unit awaiting shop input
+        may not be fitted (Part-145 145.A.42), so transferring one would move
+        a part that the receiving station cannot use, and the AOG router would
+        then count it as available.
+
+        Both updates run inside one transaction. A failure between them would
+        otherwise leave units recorded at neither station - the write
+        dependency rolls back, so the movement is all or nothing.
+
+        Executing a transfer does not consume the corresponding row in
+        transfer_recommendations. Those are Module 3's output, regenerated on
+        every optimiser run, and treating them as a work queue would mean the
+        API silently rewriting another module's results.
+    """
+    if transfer.from_station == transfer.to_station:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Origin and destination are the same station")
+
+    with stock_column(conn) as qty:
+        source = require_found(
+            fetch_one(conn, f"SELECT {qty} AS serviceable, unserviceable FROM inventory "
+                            f"WHERE part_number = ? AND station = ?",
+                      (transfer.part_number, transfer.from_station)),
+            f"Stock line {transfer.part_number} at {transfer.from_station}")
+        destination = require_found(
+            fetch_one(conn, f"SELECT {qty} AS serviceable, unserviceable FROM inventory "
+                            f"WHERE part_number = ? AND station = ?",
+                      (transfer.part_number, transfer.to_station)),
+            f"Stock line {transfer.part_number} at {transfer.to_station}")
+
+        available = int(source["serviceable"])
+        if available < transfer.quantity:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(f"{transfer.from_station} holds {available} serviceable units of "
+                        f"{transfer.part_number}; {transfer.quantity} requested"))
+
+        for station, delta in ((transfer.from_station, -transfer.quantity),
+                               (transfer.to_station, transfer.quantity)):
+            conn.execute(
+                f"UPDATE inventory SET {qty} = {qty} + ?, "
+                f"quantity_on_hand = quantity_on_hand + ? "
+                f"WHERE part_number = ? AND station = ?",
+                (delta, delta, transfer.part_number, station))
+
+        lines = fetch_all(conn, f"SELECT part_number, station, {qty} AS serviceable, "
+                                f"unserviceable, quantity_on_hand, minimum_stock_level "
+                                f"FROM inventory WHERE part_number = ? AND station IN (?, ?)",
+                          (transfer.part_number, transfer.from_station, transfer.to_station))
+
+    return Acknowledgement(
+        message=(f"{transfer.quantity} x {transfer.part_number} moved from "
+                 f"{transfer.from_station} to {transfer.to_station}"),
+        record={"lines": lines},
+    )
+
+
+@admin_router.post("/stock-recommendations/apply", response_model=Acknowledgement,
+                   tags=["admin"])
+def apply_stock_recommendations(
+    request: ApplyRecommendations,
+    conn: sqlite3.Connection = Depends(write_db),
+) -> Acknowledgement:
+    """
+    Adopt Module 3's recommended minima and reorder points into live stock.
+
+    Args:
+        request: ApplyRecommendations - optional filters and the dry-run flag.
+        conn: sqlite3.Connection - writable, committed on return.
+
+    Returns:
+        Acknowledgement reporting how many lines changed, or would change.
+
+    Raises:
+        HTTPException 503 when logistics_optimizer.py has not been run.
+
+    Notes:
+        dry_run defaults to true. This endpoint can rewrite the stocking
+        parameters of 175 lines in one call, and the safe default for an
+        operation of that reach is to describe itself first. A caller that
+        means it sends dry_run=false.
+
+        Only the minimum level and the reorder point are adopted. The
+        recommended maximum is a holding-cost ceiling rather than a dispatch
+        parameter, and physical quantities are never touched: this changes
+        what the system considers a shortage, not what is on the shelf.
+
+        The recommendations themselves are left in place, so re-running the
+        optimiser and re-applying stays idempotent.
+    """
+    if not fetch_one(conn, "SELECT 1 AS ok FROM sqlite_master WHERE type='table' "
+                           "AND name='stock_recommendations'"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No stock recommendations yet. Run: python logistics_optimizer.py")
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if request.station:
+        clauses.append("r.station = ?")
+        params.append(request.station.upper())
+    if request.criticality:
+        clauses.append("r.criticality = ?")
+        params.append(request.criticality.upper())
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    pending = fetch_all(conn, f"""
+        SELECT r.part_number, r.station, r.optimal_min_stock, r.optimal_reorder_point,
+               i.minimum_stock_level AS current_min, i.reorder_point AS current_reorder
+        FROM stock_recommendations r
+        JOIN inventory i ON i.part_number = r.part_number AND i.station = r.station
+        {where}
+    """, tuple(params))
+
+    changes = [row for row in pending
+               if row["current_min"] != row["optimal_min_stock"]
+               or row["current_reorder"] != row["optimal_reorder_point"]]
+
+    if request.dry_run:
+        return Acknowledgement(
+            ok=True,
+            message=(f"Dry run: {len(changes)} of {len(pending)} lines would change. "
+                     f"Send dry_run=false to apply."),
+            record={"would_change": len(changes), "examined": len(pending),
+                    "sample": changes[:10]},
+        )
+
+    for row in changes:
+        conn.execute("""
+            UPDATE inventory SET minimum_stock_level = ?, reorder_point = ?
+            WHERE part_number = ? AND station = ?
+        """, (row["optimal_min_stock"], row["optimal_reorder_point"],
+              row["part_number"], row["station"]))
+
+    return Acknowledgement(
+        message=f"{len(changes)} stock lines updated to the recommended levels",
+        record={"changed": len(changes), "examined": len(pending)},
+    )
+
+
+# ============================================================================
 # ROUTER REGISTRATION
 # ============================================================================
-# Registered last, after every route is defined, so the OpenAPI document is
-# assembled from routes that are all in place.
+# Registered last, after every route is defined. The admin router is included
+# only when writes are enabled, so a read-only deployment does not merely
+# refuse administrative calls - it does not publish them in the OpenAPI
+# document either, and a client generated from that document cannot attempt
+# a write the service will not perform.
 
 app.include_router(user_router)
+
+if not READ_ONLY_MODE:
+    app.include_router(admin_router)
 
 
 # ============================================================================
