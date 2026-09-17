@@ -46,33 +46,65 @@ GAP = 1
 # ============================================================================
 # PRIMITIVES
 # ============================================================================
+# Figures are drawn with box-drawing characters rather than +-|, so a border
+# reads as a line instead of as punctuation. Junctions are derived from the
+# directions a column needs rather than picked by hand, which is what keeps
+# them correct when a box moves or changes width.
 
-def box(lines, width):
+GLYPH = {
+    (0, 0, 1, 1): "\u2500", (1, 1, 0, 0): "\u2502",
+    (0, 1, 0, 1): "\u250c", (0, 1, 1, 0): "\u2510",
+    (1, 0, 0, 1): "\u2514", (1, 0, 1, 0): "\u2518",
+    (1, 1, 0, 1): "\u251c", (1, 1, 1, 0): "\u2524",
+    (0, 1, 1, 1): "\u252c", (1, 0, 1, 1): "\u2534",
+    (1, 1, 1, 1): "\u253c",
+    (1, 0, 0, 0): "\u2502", (0, 1, 0, 0): "\u2502",
+}
+
+
+def glyph(up=0, down=0, left=0, right=0):
+    """
+    Return the box-drawing character that joins the given directions.
+
+    Args:
+        up, down, left, right: truthy when the character must connect that way.
+
+    Returns:
+        str - one character.
+
+    Raises:
+        KeyError for a combination with no glyph, which means the figure asked
+        for a junction that cannot be drawn - a bug worth failing on.
+    """
+    return GLYPH[(int(bool(up)), int(bool(down)), int(bool(left)), int(bool(right)))]
+
+
+def box(lines, width, pad=2):
     """
     Frame a block of text.
 
     Args:
-        lines: list of str - the contents, one entry per line. An empty string
-            renders as a blank line inside the frame.
-        width: int - total width of the box including both borders.
+        lines: list of str - the contents, one per line; "" renders blank.
+        width: int - total width including both borders.
+        pad: int - columns of indent inside the left border.
 
     Returns:
         list of str - the framed box.
 
     Raises:
-        ValueError when a line does not fit. This is deliberately fatal: a
-        silently truncated or overflowing line is exactly the failure this
-        module exists to prevent, and the message names the line and both
-        measurements so the fix is obvious.
+        ValueError when a line does not fit. Deliberately fatal: a silently
+        overflowing line is the failure this module exists to prevent, and the
+        message names the line and both measurements.
     """
-    area = width - 4                      # two borders, two-space inner indent
+    area = width - 2 - pad
     for line in lines:
         if len(line) > area:
             raise ValueError(
                 f"{line!r} needs {len(line)} columns, this box holds {area}")
-    border = "+" + "-" * (width - 2) + "+"
-    body = ["|" + ("  " + line).ljust(width - 2) + "|" for line in lines]
-    return [border] + body + [border]
+    top = "\u250c" + "\u2500" * (width - 2) + "\u2510"
+    bottom = "\u2514" + "\u2500" * (width - 2) + "\u2518"
+    body = ["\u2502" + (" " * pad + line).ljust(width - 2) + "\u2502" for line in lines]
+    return [top] + body + [bottom]
 
 
 def row(boxes, gap=GAP, margin=MARGIN):
@@ -86,19 +118,18 @@ def row(boxes, gap=GAP, margin=MARGIN):
 
     Returns:
         tuple (list of str, list of int) - the rendered lines, and the centre
-        column of each box. The centres are what every connector below is
-        drawn from, which is why they are returned rather than recomputed.
+        column of each box. Every connector below is drawn from those centres.
 
     Notes:
         Shorter boxes are padded with blank frame lines so the row closes at
-        the same height, and boxes may have different widths - the middle
-        column of the engine row is wider because "stock_recommendations" is
-        a table name and abbreviating it in a diagram would be a small lie.
+        one height, and boxes may differ in width - the middle column of the
+        engine row is wider because "stock_recommendations" is a table name
+        and abbreviating it in a diagram would be a small lie.
     """
     height = max(len(b) for b in boxes)
     padded = []
     for b in boxes:
-        filler = "|" + " " * (len(b[0]) - 2) + "|"
+        filler = "\u2502" + " " * (len(b[0]) - 2) + "\u2502"
         padded.append(b[:-1] + [filler] * (height - len(b)) + [b[-1]])
     lines = [" " * margin + (" " * gap).join(parts) for parts in zip(*padded)]
 
@@ -109,58 +140,74 @@ def row(boxes, gap=GAP, margin=MARGIN):
     return lines, centres
 
 
-def at(centres, char="|"):
+def tap(lines, index, columns, downward):
     """
-    Draw one line carrying a character at each given column.
+    Open a box border where a connector meets it.
 
     Args:
-        centres: list of int - the columns to mark.
-        char: str - "|" for a stem, "v" for an arrowhead.
+        lines: list of str - the rendered rows; modified in place.
+        index: int - which row holds the border, usually 0 or -1.
+        columns: list of int - where the connector touches.
+        downward: bool - True for a line leaving a bottom edge, False for one
+            arriving at a top edge.
 
     Returns:
-        str - the rendered line.
+        None.
+
+    Notes:
+        This is what makes the figure look drawn rather than assembled: a line
+        enters the border instead of stopping one row above it.
     """
-    line = [" "] * (max(centres) + 1)
-    for c in centres:
-        line[c] = char
+    chars = list(lines[index])
+    for column in columns:
+        chars[column] = glyph(up=not downward, down=downward, left=1, right=1)
+    lines[index] = "".join(chars)
+
+
+def stem(columns):
+    """
+    Draw one row carrying a vertical stroke at each given column.
+
+    Args:
+        columns: list of int - the columns to mark.
+
+    Returns:
+        str - the rendered row.
+    """
+    line = [" "] * (max(columns) + 1)
+    for column in columns:
+        line[column] = "\u2502"
     return "".join(line)
 
 
-def gather(centres, target):
+def junction(up, down):
     """
-    Draw a bracket collecting several columns into one.
+    Draw the horizontal run joining a set of columns above to a set below.
 
     Args:
-        centres: list of int - the columns being collected.
-        target: int - the column the flow continues down.
+        up: list of int - columns where a line arrives from above.
+        down: list of int - columns where a line continues below.
 
     Returns:
-        str - the rendered bracket.
+        str - the rendered row.
+
+    Notes:
+        One primitive serves both fans: one column above and three below is a
+        distribution, three above and one below is a collection, and a column
+        that appears in both renders as a crossing rather than as two
+        characters fighting over one cell.
     """
-    line = [" "] * (max(max(centres), target) + 1)
-    for i in range(min(centres), max(centres) + 1):
-        line[i] = "-"
-    for c in list(centres) + [target]:
-        line[c] = "+"
-    return "".join(line)
+    columns = list(up) + list(down)
+    lo, hi = min(columns), max(columns)
+    marks = {c: {"left": c > lo, "right": c < hi} for c in range(lo, hi + 1)}
+    for column in down:
+        marks[column]["down"] = True
+    for column in up:
+        marks[column]["up"] = True
 
-
-def spread(source, targets):
-    """
-    Draw a bracket fanning one column out to several.
-
-    Args:
-        source: int - the column the flow arrives on.
-        targets: list of int - the columns it fans out to.
-
-    Returns:
-        str - the rendered bracket.
-    """
-    line = [" "] * (max(max(targets), source) + 1)
-    for i in range(min(targets), max(targets) + 1):
-        line[i] = "-"
-    for t in list(targets) + [source]:
-        line[t] = "+"
+    line = [" "] * (hi + 1)
+    for column, directions in marks.items():
+        line[column] = glyph(**directions)
     return "".join(line)
 
 
@@ -179,36 +226,45 @@ def build():
         str - the complete figure, without the surrounding code fence.
 
     Notes:
-        Box widths are chosen so that Module 1, the database and the middle
-        engine share a centre column: the figure then has one vertical spine
-        running from the pipeline down to the consumers, and a reader's eye
-        follows the data rather than hunting for the next arrow.
+        Box widths are chosen so Module 1, the database and the middle engine
+        share a centre column: the figure then has one vertical spine from the
+        pipeline down to the consumers, and a reader's eye follows the data
+        rather than hunting for the next connector.
     """
     out = []
 
-    # --- what the system is given ---------------------------------------
-    out += [
-        "        raw_data/                                   config.py",
-        "     FAA SDR CSV, 413K rows                  hardware auto-detection",
-        "     JASC / ATA code list                    MINIMAL / STANDARD / FULL",
-        "             |                                          |",
-        "             |                                          |  imported by",
-        "             v                                          v  modules 1-3, 5, 6",
-    ]
+    # --- what the system is given ----------------------------------------
+    # config.py is drawn as an input because that is what it is: every
+    # compute-heavy module imports it for its tuning parameters. Only its edge
+    # into Module 1 is drawn - six edges to the same box would bury the data
+    # flow, so the box states the rest in words.
+    inputs, input_centres = row([
+        box(["raw_data/", "",
+             "FAA SDR CSV, 413K filed reports",
+             "JASC / ATA code list"], 35),
+        box(["config.py", "",
+             "hardware auto-detection",
+             "MINIMAL / STANDARD / FULL",
+             "imported by modules 1-3, 5, 6"], 35),
+    ])
+    tap(inputs, -1, input_centres, downward=True)
+    out += inputs + [stem(input_centres)]
 
-    # --- Module 1 --------------------------------------------------------
+    # --- Module 1 ---------------------------------------------------------
     pipeline, spine = row([box([
         "MODULE 1 - data_pipeline.py",
         "",
-        "SDR parser        413K filed reports -> filter -> 195,801 kept",
+        "SDR parser        413K filed reports \u2192 filter \u2192 195,801 kept",
         "Fleet generator   15 airframes, A320 family, 5 Greek stations",
         "Flight simulator  3 years, seasonal schedule, 54,532 sectors",
         "Failure model     Weibull (rotable)  Poisson (expendable)",
         "                  deterministic (consumable)",
     ], 74)])
-    out += pipeline
+    tap(pipeline, 0, input_centres, downward=False)
+    tap(pipeline, -1, spine, downward=True)
+    out += pipeline + [stem(spine)]
 
-    # --- the database ----------------------------------------------------
+    # --- the database -----------------------------------------------------
     # Margin chosen so this box centres on the same column as Module 1.
     database, db_centre = row([box([
         "aerosupply.db",
@@ -216,7 +272,9 @@ def build():
         "12 tables, 3 views, 106 MB",
         "SQLite / PostgreSQL / MySQL",
     ], 33)], margin=23)
-    out += [at(spine), at(spine, "v")] + database
+    tap(database, 0, db_centre, downward=False)
+    tap(database, -1, db_centre, downward=True)
+    out += database
 
     # --- the three engines ------------------------------------------------
     engines, engine_centres = row([
@@ -233,20 +291,25 @@ def build():
              "keyword-routed,", "no synthesised SQL", "",
              "demo / -i / -q", ""], 24),
     ])
-    out += [at(db_centre), spread(db_centre[0], engine_centres),
-            at(engine_centres, "v")] + engines
+    tap(engines, 0, engine_centres, downward=False)
+    tap(engines, -1, engine_centres, downward=True)
+    out += [junction(up=db_centre, down=engine_centres)] + engines
 
-    # --- what each engine leaves behind ----------------------------------
+    # --- what each engine leaves behind ------------------------------------
     # One box per engine, which is what makes it visible that Module 4 writes
     # nothing back: it reads the same tables the other two populate.
-    artefacts, _ = row([
+    artefacts, artefact_centres = row([
         box(["3 PNG plots", "survival, demand,", "SDR analysis"], 24),
         box(["written back to db", "stock_recommendations", "transfer_recommend."], 25),
         box(["terminal reports", "read back from the", "same tables"], 24),
     ])
-    out += [at(engine_centres), at(engine_centres, "v")] + artefacts
+    tap(artefacts, 0, artefact_centres, downward=False)
+    # Module 4 produces terminal output and nothing the other modules consume,
+    # so its column ends here rather than continuing into the consumers.
+    tap(artefacts, -1, artefact_centres[:2], downward=True)
+    out += [stem(engine_centres)] + artefacts
 
-    # --- the two consumers ------------------------------------------------
+    # --- the two consumers -------------------------------------------------
     consumers, consumer_centres = row([
         box(["MODULE 5 - dashboard.py", "streamlit run dashboard.py", "",
              "Fleet Overview     map, register", "Parts & Inventory  search, bars",
@@ -256,14 +319,10 @@ def build():
              "/api/user/*    17 routes, read", "/api/admin/*    5 routes, write", "",
              "require_user / require_admin", "the seam v1.3 fills with JWT"], 37),
     ])
-    hub = (min(engine_centres) + max(engine_centres)) // 2
-    out += [at(engine_centres),
-            gather(engine_centres, hub),
-            at([hub]),
-            spread(hub, consumer_centres),
-            at(consumer_centres, "v")] + consumers
+    tap(consumers, 0, consumer_centres, downward=False)
+    out += [junction(up=artefact_centres[:2], down=consumer_centres)] + consumers
 
-    # --- what holds everywhere -------------------------------------------
+    # --- what holds everywhere ---------------------------------------------
     # Stated once at the foot rather than repeated in every box, because these
     # are properties of every path through the system.
     out += [

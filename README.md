@@ -18,67 +18,61 @@ License: MIT
 ## Architecture
 
 ```
-        raw_data/                                   config.py
-     FAA SDR CSV, 413K rows                  hardware auto-detection
-     JASC / ATA code list                    MINIMAL / STANDARD / FULL
-             |                                          |
-             |                                          |  imported by
-             v                                          v  modules 1-3, 5, 6
-  +------------------------------------------------------------------------+
-  |  MODULE 1 - data_pipeline.py                                           |
-  |                                                                        |
-  |  SDR parser        413K filed reports -> filter -> 195,801 kept        |
-  |  Fleet generator   15 airframes, A320 family, 5 Greek stations         |
-  |  Flight simulator  3 years, seasonal schedule, 54,532 sectors          |
-  |  Failure model     Weibull (rotable)  Poisson (expendable)             |
-  |                    deterministic (consumable)                          |
-  +------------------------------------------------------------------------+
-                                       |
-                                       v
-                       +-------------------------------+
-                       |  aerosupply.db                |
-                       |                               |
-                       |  12 tables, 3 views, 106 MB   |
-                       |  SQLite / PostgreSQL / MySQL  |
-                       +-------------------------------+
-                                       |
-              +------------------------+-------------------------+
-              v                        v                         v
-  +----------------------+ +-----------------------+ +----------------------+
-  |  MODULE 2            | |  MODULE 3             | |  MODULE 4            |
-  |  prediction_model.py | |  logistics_optimizer  | |  agent.py            |
-  |                      | |                       | |                      |
-  |  Cox PH + Weibull AFT| |  Stock levels (s,S)   | |  NL query router     |
-  |  rotable survival    | |  z set by MEL class   | |  10 vetted reports   |
-  |                      | |                       | |                      |
-  |  XGBoost regression  | |  Pre-positioning      | |  keyword-routed,     |
-  |  expendable demand   | |  30 transfers         | |  no synthesised SQL  |
-  |                      | |                       | |                      |
-  |  XGBoost classifier  | |  AOG router           | |  demo / -i / -q      |
-  |  real SDR, 87.6%     | |  EUR 15,000 / hour    | |                      |
-  +----------------------+ +-----------------------+ +----------------------+
-              |                        |                         |
-              v                        v                         v
-  +----------------------+ +-----------------------+ +----------------------+
-  |  3 PNG plots         | |  written back to db   | |  terminal reports    |
-  |  survival, demand,   | |  stock_recommendations| |  read back from the  |
-  |  SDR analysis        | |  transfer_recommend.  | |  same tables         |
-  +----------------------+ +-----------------------+ +----------------------+
-              |                        |                         |
-              +------------------------+-------------------------+
-                                       |
-                    +------------------+------------------+
-                    v                                     v
-  +-----------------------------------+ +-----------------------------------+
-  |  MODULE 5 - dashboard.py          | |  MODULE 6 - api.py                |
-  |  streamlit run dashboard.py       | |  uvicorn api:app                  |
-  |                                   | |                                   |
-  |  Fleet Overview     map, register | |  /api/user/*    17 routes, read   |
-  |  Parts & Inventory  search, bars  | |  /api/admin/*    5 routes, write  |
-  |  Predictions        plots, risk   | |                                   |
-  |  Logistics          AOG simulator | |  require_user / require_admin     |
-  |  SDR Analysis       FAA corpus    | |  the seam v1.3 fills with JWT     |
-  +-----------------------------------+ +-----------------------------------+
+  ┌─────────────────────────────────┐ ┌─────────────────────────────────┐
+  │  raw_data/                      │ │  config.py                      │
+  │                                 │ │                                 │
+  │  FAA SDR CSV, 413K filed reports│ │  hardware auto-detection        │
+  │  JASC / ATA code list           │ │  MINIMAL / STANDARD / FULL      │
+  │                                 │ │  imported by modules 1-3, 5, 6  │
+  └────────────────┬────────────────┘ └────────────────┬────────────────┘
+                   │                                   │
+  ┌────────────────┴───────────────────────────────────┴───────────────────┐
+  │  MODULE 1 - data_pipeline.py                                           │
+  │                                                                        │
+  │  SDR parser        413K filed reports → filter → 195,801 kept          │
+  │  Fleet generator   15 airframes, A320 family, 5 Greek stations         │
+  │  Flight simulator  3 years, seasonal schedule, 54,532 sectors          │
+  │  Failure model     Weibull (rotable)  Poisson (expendable)             │
+  │                    deterministic (consumable)                          │
+  └────────────────────────────────────┬───────────────────────────────────┘
+                                       │
+                       ┌───────────────┴───────────────┐
+                       │  aerosupply.db                │
+                       │                               │
+                       │  12 tables, 3 views, 106 MB   │
+                       │  SQLite / PostgreSQL / MySQL  │
+                       └───────────────┬───────────────┘
+              ┌────────────────────────┼─────────────────────────┐
+  ┌───────────┴──────────┐ ┌───────────┴───────────┐ ┌───────────┴──────────┐
+  │  MODULE 2            │ │  MODULE 3             │ │  MODULE 4            │
+  │  prediction_model.py │ │  logistics_optimizer  │ │  agent.py            │
+  │                      │ │                       │ │                      │
+  │  Cox PH + Weibull AFT│ │  Stock levels (s,S)   │ │  NL query router     │
+  │  rotable survival    │ │  z set by MEL class   │ │  10 vetted reports   │
+  │                      │ │                       │ │                      │
+  │  XGBoost regression  │ │  Pre-positioning      │ │  keyword-routed,     │
+  │  expendable demand   │ │  30 transfers         │ │  no synthesised SQL  │
+  │                      │ │                       │ │                      │
+  │  XGBoost classifier  │ │  AOG router           │ │  demo / -i / -q      │
+  │  real SDR, 87.6%     │ │  EUR 15,000 / hour    │ │                      │
+  └───────────┬──────────┘ └───────────┬───────────┘ └───────────┬──────────┘
+              │                        │                         │
+  ┌───────────┴──────────┐ ┌───────────┴───────────┐ ┌───────────┴──────────┐
+  │  3 PNG plots         │ │  written back to db   │ │  terminal reports    │
+  │  survival, demand,   │ │  stock_recommendations│ │  read back from the  │
+  │  SDR analysis        │ │  transfer_recommend.  │ │  same tables         │
+  └───────────┬──────────┘ └───────────┬───────────┘ └──────────────────────┘
+              └─────┬──────────────────┴──────────────────┐
+  ┌─────────────────┴─────────────────┐ ┌─────────────────┴─────────────────┐
+  │  MODULE 5 - dashboard.py          │ │  MODULE 6 - api.py                │
+  │  streamlit run dashboard.py       │ │  uvicorn api:app                  │
+  │                                   │ │                                   │
+  │  Fleet Overview     map, register │ │  /api/user/*    17 routes, read   │
+  │  Parts & Inventory  search, bars  │ │  /api/admin/*    5 routes, write  │
+  │  Predictions        plots, risk   │ │                                   │
+  │  Logistics          AOG simulator │ │  require_user / require_admin     │
+  │  SDR Analysis       FAA corpus    │ │  the seam v1.3 fills with JWT     │
+  └───────────────────────────────────┘ └───────────────────────────────────┘
 
   Read discipline, the same on every path:
     mode=ro connection   a read handler cannot write - the driver refuses
